@@ -1,4 +1,4 @@
-# 南风 H3 V4 for ComfyUI / NanFeng H3 V4 for ComfyUI
+# 南风 H3 V6 for ComfyUI / NanFeng H3 V6 for ComfyUI
 
 **中文说明** · **English documentation below**
 
@@ -12,7 +12,7 @@
 
 ## 节点截图 / Node Screenshots
 
-### 南风 H3 多参视频生成 V4 / NanFeng H3 Multi-Reference Generator V4
+### 南风 H3 多参视频生成 V6 / NanFeng H3 Multi-Reference Generator V6
 
 ![南风H3多参视频生成V4节点 / NanFeng H3 V4 node](docs/assets/nanfeng-h3-v4-node.png)
 
@@ -48,18 +48,23 @@ Each non-empty prompt box becomes an independent top-level queue job in strict t
 
 不能介绍成Seedance 2节点、Seedance 2模型移植或官方联合项目。
 
-## 主要功能
+## V6 主要功能
 
-- **南风H3多参视频生成V4**：封装MiniMax H3模型加载、条件构建、采样和音视频解码。
+- **南风H3多参视频生成V6**：保留V1–V5兼容节点，封装MiniMax H3模型加载、条件构建、采样和音视频解码。
+- **不再静默切换模型**：V6切换多参、T2V、I2V或首尾帧时，前后端都保留用户实际选择的扩散模型。
+- **分镜工作区**：提示词框加高，支持新建、完整复制、删除和切换分镜；每个分镜保存独立提示词、图片、视频和音频槽位。
+- **单人/双人小脸修复**：两个开关互斥，也可以全部关闭；双人分别追踪、重绘并依次贴回。
+- **同图选人**：双人模式可以从同一身份参考图中分别选择最左、左起第2/3或最右人物。
+- **FaceRefine伴随补丁**：`integrations/ComfyUI-H3-FaceRefine/`保存V6所需的多人身份选择实现。
 - **Ref2VA多模态参考**：最多9张图片、3个视频、3段音频。
 - **FL2VA模式**：文生视频、首帧图生视频、首尾帧模式互斥切换。
 - **素材引用**：输入`@图片1`等引用，自动转换为H3原生多模态标签。
 - **南风提示词列表**：多个提示词拆成独立任务，按框从上到下执行。
 - **LoRA**：最多3组模型LoRA，默认关闭。
 - **可选加速**：支持已安装环境中的SageAttention、Sol-Attn和MiniMax H3 Block Cache（T8）。
-- **Sigma V4**：可关闭的Sigma Shift、低Sigma加密、手动Sigma和可选双阶段采样。
+- **Sigma与高清二采**：保留V4 Sigma控制，并提供解码、放大、重编码和低强度独立二采路径。
 - **安全尺寸**：`原图比例`只读取首帧宽高比，像素面积仍由`百万像素`控制；参考图最长边不超过1920，较小原图不放大。
-- 保留V1–V4节点类ID，尽量兼容旧工作流。
+- 保留V1–V6节点类ID，尽量兼容旧工作流。
 
 ## 中英文支持情况
 
@@ -87,6 +92,21 @@ Each non-empty prompt box becomes an independent top-level queue job in strict t
 
 ```bash
 git clone https://github.com/wwjjqq888888-pixel/nanfeng-h3-comfyui.git nanfeng_prompt_nodes
+```
+
+V6小脸修复需要上游`ComfyUI-H3-FaceRefine`插件。请先备份原插件，再把本仓库伴随目录中的文件覆盖到该插件：
+
+```text
+integrations/ComfyUI-H3-FaceRefine/
+  → ComfyUI/custom_nodes/ComfyUI-H3-FaceRefine/
+```
+
+仓库不包含人脸检测模型、InsightFace数据、H3模型权重或LoRA。
+
+小脸修复还**必须安装**`ComfyUI-H3-NativeAudioLock`，因为V6每条FaceRefine链都会使用`MiniMaxH3NativeAudioLock`锁定原生成音频并保持音画时序。请把该插件安装到：
+
+```text
+ComfyUI/custom_nodes/ComfyUI-H3-NativeAudioLock/
 ```
 
 重启ComfyUI，按`Ctrl+F5`，然后导入：
@@ -137,18 +157,23 @@ A precise project description is:
 
 It must not be described as a Seedance 2 node, a port of the Seedance 2 model, or an official joint project.
 
-## Features
+## V6 features
 
-- **NanFeng H3 Multi-Reference Generator V4:** wraps MiniMax H3 loading, conditioning, sampling, and audio/video decoding.
+- **NanFeng H3 Multi-Reference Generator V6:** retains V1–V5 compatibility classes and wraps MiniMax H3 loading, conditioning, sampling, and audio/video decoding.
+- **No silent checkpoint switching in V6:** Ref2VA/T2V/I2V/first-last mode changes preserve the diffusion checkpoint selected by the user in both the UI and backend graph.
+- **Storyboard workspace:** taller prompt editor plus new, deep-copy, delete, and selectable storyboard tabs; every storyboard stores independent prompt/image/video/audio state.
+- **Single/two-person small-face refinement:** mutually exclusive modes, or both off. Two-person mode runs identity-locked independent refinement chains and stitches sequentially.
+- **Select two people from one image:** choose the leftmost, second/third from left, or rightmost face independently for each identity.
+- **Companion FaceRefine patch:** `integrations/ComfyUI-H3-FaceRefine/` contains the matching multi-identity implementation required by V6.
 - **Ref2VA references:** up to 9 images, 3 videos, and 3 audio files.
 - **FL2VA modes:** text-to-video, first-frame image-to-video, and first/last-frame generation.
 - **Media references:** converts `@图片1`-style references to native H3 multimodal tags.
 - **Prompt List:** each non-empty box becomes an independent queue job in top-to-bottom order.
 - **LoRA:** up to three model-only LoRAs, disabled by default.
 - **Optional acceleration:** SageAttention, Sol-Attn, and MiniMax H3 Block Cache (T8) when available.
-- **V4 Sigma controls:** optional Sigma Shift, low-Sigma densification, manual Sigma sequences, and optional two-stage sampling.
+- **Sigma and true HD second pass:** V4 Sigma controls plus an independent decode/upscale/re-encode/low-denoise H3 second pass.
 - **Safe sizing:** Original Aspect Ratio reads only the first-frame aspect ratio; Megapixels remains the output-area budget. Reference images are capped at a 1920-pixel longest edge and are not upscaled when smaller.
-- V1–V4 class IDs are retained for legacy-workflow compatibility.
+- V1–V6 class IDs are retained for legacy-workflow compatibility.
 
 ## Chinese and English support
 
@@ -176,6 +201,21 @@ Run inside `ComfyUI/custom_nodes/`:
 
 ```bash
 git clone https://github.com/wwjjqq888888-pixel/nanfeng-h3-comfyui.git nanfeng_prompt_nodes
+```
+
+V6 FaceRefine requires the upstream `ComfyUI-H3-FaceRefine` plugin. Back up that plugin, then copy the matching companion files from:
+
+```text
+integrations/ComfyUI-H3-FaceRefine/
+  → ComfyUI/custom_nodes/ComfyUI-H3-FaceRefine/
+```
+
+Face detectors, InsightFace data, H3 model weights, and LoRAs are not included.
+
+V6 FaceRefine also **requires** `ComfyUI-H3-NativeAudioLock`. Every refinement chain uses `MiniMaxH3NativeAudioLock` to preserve the generated audio and AV timing. Install it under:
+
+```text
+ComfyUI/custom_nodes/ComfyUI-H3-NativeAudioLock/
 ```
 
 Restart ComfyUI, hard-refresh with `Ctrl+F5`, and import:

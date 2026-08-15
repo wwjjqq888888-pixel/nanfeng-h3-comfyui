@@ -41,6 +41,49 @@ def _select_fl2va_model(selected_model: str, installed: list[str]) -> str:
         FL2VA_MODEL_NAME,
     )
 
+
+SECOND_MODEL_SAME = "跟随一采模型（质量优先）"
+SECOND_MODEL_AUTO = "自动轻量模型（Ref / FL匹配）"
+FACE_REFINE_OFF = "关闭（原始输出）"
+FACE_REFINE_ON = "远景小脸修复（H3 FaceRefine）"
+
+
+def _select_face_refine_turbo_lora(installed: list[str]) -> str:
+    """选择本机H3四步Turbo LoRA；FaceRefine固定四步链路不能在无蒸馏LoRA时静默运行。"""
+    candidates = [x for x in installed if "h3" in x.lower() and "turbo" in x.lower() and "4step" in x.lower()]
+    for marker in ("ema_ckpt850_pruned", "4step_pruned", "4_step"):
+        match = next((x for x in candidates if marker in x.lower()), None)
+        if match:
+            return match
+    if candidates:
+        return candidates[0]
+    raise ValueError(
+        "远景小脸修复需要H3四步Turbo LoRA；请把 minimax_h3_*turbo*4step*.safetensors "
+        "放入 ComfyUI/models/loras/H3 后刷新模型列表。"
+    )
+
+
+def _select_second_pass_model(requested: str, installed: list[str], fl_mode: bool, first_model: str) -> str:
+    """二采自动选择同任务家族的轻量权重；没有轻量版时回退当前一采模型。"""
+    family = "fl2va" if fl_mode else "ref2va"
+    requested = str(requested or SECOND_MODEL_SAME)
+    compatible = [x for x in installed if _is_h3_video_model(x) and family in x.lower()]
+    if requested == SECOND_MODEL_SAME:
+        return first_model
+    if requested != SECOND_MODEL_AUTO:
+        if requested not in installed:
+            raise ValueError(f"二采模型不存在或尚未被ComfyUI扫描：{requested}")
+        if family not in requested.lower():
+            raise ValueError(f"当前模式需要{family.upper()}二采模型，不能使用：{requested}")
+        return requested
+    for marker in ("pruned_w4a8_mixed", "w4a8_mixed", "pruned_int8", "pruned_fp8"):
+        match = next((x for x in compatible if marker in x.lower()), None)
+        if match:
+            return match
+    if family in str(first_model).lower():
+        return first_model
+    return compatible[0] if compatible else first_model
+
 RATIOS = {
     "1:1 (Square)": (1, 1), "2:3 (Portrait Photo)": (2, 3),
     "3:2 (Photo)": (3, 2), "3:4 (Portrait Standard)": (3, 4),
@@ -118,6 +161,62 @@ def _parse_manual_sigmas(text: str) -> list[float]:
     return values
 
 
+class NanFengH3UpscaleForSecondPass:
+    """按目标百万像素逐帧放大一采视频，并保持原始宽高比与32倍数。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "image": ("IMAGE",),
+            "megapixels": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 2.0, "step": 0.1}),
+            "method": (["lanczos", "bicubic", "bilinear", "nearest-exact"], {"default": "lanczos"}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "INT", "INT")
+    RETURN_NAMES = ("image", "width", "height")
+    FUNCTION = "upscale"
+    CATEGORY = CATEGORY
+
+    def upscale(self, image, megapixels, method):
+        import comfy.utils
+        source_height, source_width = int(image.shape[1]), int(image.shape[2])
+        source_area = source_width * source_height
+        target_area = float(megapixels) * 1024 * 1024
+        if target_area <= source_area:
+            return image, source_width, source_height
+        scale = math.sqrt(target_area / max(1, source_area))
+        width = max(32, round(source_width * scale / 32) * 32)
+        height = max(32, round(source_height * scale / 32) * 32)
+        samples = image[..., :3].movedim(-1, 1)
+        resized = comfy.utils.common_upscale(samples, width, height, str(method), "disabled").movedim(1, -1)
+        return resized, width, height
+
+
+class NanFengH3RebuildAVLatent:
+    """用放大重编码后的视频Latent替换H3嵌套AV Latent中的视频流，保留原音频流。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"video_latent": ("LATENT",), "source_av_latent": ("LATENT",)}}
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "rebuild"
+    CATEGORY = CATEGORY
+
+    def rebuild(self, video_latent, source_av_latent):
+        from comfy.nested_tensor import NestedTensor
+        video = video_latent["samples"]
+        source = source_av_latent["samples"]
+        if not getattr(source, "is_nested", False):
+            raise ValueError("高清二采需要MiniMax H3音视频嵌套Latent。")
+        streams = source.unbind()
+        if len(streams) < 2:
+            raise ValueError("MiniMax H3 Latent缺少音频流，无法重组高清二采输入。")
+        result = source_av_latent.copy()
+        result["samples"] = NestedTensor((video, streams[-1]))
+        return (result,)
+
+
 class NanFengH3AddFinalSigmaStep:
     """只在最后一个非零Sigma区间增加一个中点，供FL2VA做极轻微高频收尾。"""
 
@@ -135,6 +234,35 @@ class NanFengH3AddFinalSigmaStep:
             return (sigmas,)
         midpoint = (sigmas[-2] + sigmas[-1]) * 0.5
         return (torch.cat((sigmas[:-1], midpoint.reshape(1), sigmas[-1:])),)
+
+
+class NanFengH3TrimSigmasAtStart:
+    """为高清二采从用户指定的精确Sigma开始，保留其后的原生下降轨迹。"""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "sigmas": ("SIGMAS",),
+            "start_sigma": ("FLOAT", {"default": 0.2, "min": 0.01, "max": 1.0, "step": 0.01}),
+        }}
+
+    RETURN_TYPES = ("SIGMAS",)
+    FUNCTION = "trim"
+    CATEGORY = "南风节点/内部"
+
+    def trim(self, sigmas, start_sigma):
+        import torch
+        start = float(start_sigma)
+        if not math.isfinite(start) or start <= 0.0:
+            raise ValueError("二采起始Sigma必须是大于0的有限数值。")
+        flat = sigmas.flatten()
+        if flat.numel() < 2:
+            raise ValueError("二采Sigma轨迹至少需要两个值。")
+        if start >= float(flat[0]):
+            return (flat,)
+        tail = flat[flat < start]
+        if tail.numel() == 0 or float(tail[-1]) != 0.0:
+            tail = torch.cat((tail, flat.new_zeros(1)))
+        return (torch.cat((flat.new_tensor([start]), tail)),)
 
 
 def _aggressive_h3_vram_release(mm, collect_garbage):
@@ -492,6 +620,33 @@ class NanFengH3ReleaseBeforeSampling:
         return (model, conditioning, latent)
 
 
+class NanFengH3ReleaseBeforeSecondModel:
+    """放大Latent就绪后卸载一采/CLIP/VAE，再按文件名加载独立二采模型。"""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "unet_name": ("STRING", {"default": ""}),
+            "conditioning": ("CONDITIONING",),
+            "latent": ("LATENT",),
+        }}
+
+    RETURN_TYPES = ("STRING", "CONDITIONING", "LATENT")
+    RETURN_NAMES = ("unet_name", "conditioning", "latent")
+    FUNCTION = "release"
+    CATEGORY = "南风节点/内部"
+    NOT_IDEMPOTENT = True
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("NaN")
+
+    def release(self, unet_name, conditioning, latent):
+        import gc
+        import comfy.model_management as mm
+        _aggressive_h3_vram_release(mm, gc.collect)
+        return (unet_name, conditioning, latent)
+
+
 class NanFengH3MultiReferenceGenerator:
     @classmethod
     def INPUT_TYPES(cls):
@@ -506,7 +661,7 @@ class NanFengH3MultiReferenceGenerator:
             vaes = [DEFAULT_VIDEO_VAE, DEFAULT_AUDIO_VAE]
 
         h3_models = [x for x in model_options if _is_h3_video_model(x)] or list(DEFAULT_MODEL_OPTIONS)
-        # Prefer the full Ref2VA INT8 checkpoint over a pruned variant when both are installed.
+        # 优先使用完整INT8版，不默认选择pruned版。
         source_model = next((x for x in h3_models if x.replace("\\", "/").lower().endswith("minimax_h3_ref2va_int8_convrot.safetensors") and "pruned" not in x.lower()), h3_models[0])
         h3_text_encoders = [x for x in text_encoders if "minimax_h3" in x.lower()] or [DEFAULT_TEXT_ENCODER]
         h3_video_vaes = [x for x in vaes if "minimax_h3_video_vae" in x.lower()] or [DEFAULT_VIDEO_VAE]
@@ -520,7 +675,7 @@ class NanFengH3MultiReferenceGenerator:
             ("视频VAE", (h3_video_vaes, {"default": h3_video_vaes[0]})),
             ("音频VAE", (h3_audio_vaes, {"default": h3_audio_vaes[0]})),
             ("模型权重精度", (["default", "fp8_e4m3fn", "fp8_e5m2"], {"default": "default"})),
-            # Preserve the established KJ SageAttention auto default.
+            # 默认沿用KJ SageAttention=auto。
             ("SageAttention", (SAGE_MODES, {"default": "auto"})),
             ("允许编译", ("BOOLEAN", {"default": False})),
             ("画面比例", (list(RATIOS), {"default": "16:9 (Widescreen)"})),
@@ -598,7 +753,9 @@ class NanFengH3MultiReferenceGenerator:
         # 不再在一个Python函数中手工持有整套模型对象。
         g = GraphBuilder()
         selected_model = 模型
-        if fl_mode:
+        # V6起，模式切换只改变条件节点，不得替用户改动“模型”下拉选择。
+        # V1-V5保留既有自动Ref/FL家族切换，避免破坏旧工作流行为。
+        if fl_mode and not isinstance(self, NanFengH3MultiReferenceGeneratorV6):
             try:
                 import folder_paths
                 installed = folder_paths.get_filename_list("diffusion_models")
@@ -683,7 +840,7 @@ class NanFengH3MultiReferenceGenerator:
         video_vae = g.node("VAELoader", vae_name=video_vae_name)
         audio_vae = g.node("VAELoader", vae_name=audio_vae_name)
         if fl_mode:
-            # Preserve the native MiniMax H3 FL2VA conditioning contract.
+            # FL2VA模式使用官方原生条件节点。
             conditioning_release = g.node("NanFengH3ReleaseBeforeConditioning", clip=clip.out(0), vae=video_vae.out(0))
             condition_inputs = {
                 "clip": conditioning_release.out(0), "vae": conditioning_release.out(1), "prompt": 提示词,
@@ -738,6 +895,9 @@ class NanFengH3MultiReferenceGenerator:
             ).out(0)
         noise = g.node("RandomNoise", noise_seed=int(随机种子))
         sigma_requested = isinstance(self, NanFengH3MultiReferenceGeneratorV4) and bool(kwargs.get("启用西格玛调节", False))
+        hd_second_pass = isinstance(self, NanFengH3MultiReferenceGeneratorV5) and bool(kwargs.get("启用高清二采", False))
+        if hd_second_pass and sigma_requested:
+            raise ValueError("V5高清二采与西格玛调节不能同时开启；请关闭其中一个。")
         # V4按真实执行状态自动分流：LoRA完全关闭Sigma；裸Ref2VA沿用完整设置；
         # 裸FL2VA（文生/图生/首尾）只在最终高频区间增加一个中点。
         lora_active = bool(kwargs.get("启用LoRA", False)) and any(
@@ -756,7 +916,8 @@ class NanFengH3MultiReferenceGenerator:
             ).out(0)
         guider = g.node("BasicGuider", model=sampling_model, conditioning=sampling_ready.out(1))
         sampler = g.node("KSamplerSelect", sampler_name=采样器)
-        base_sigmas = g.node("BasicScheduler", model=sampling_model, scheduler=调度器, steps=int(采样步数), denoise=float(降噪强度))
+        first_steps = int(kwargs.get("一采步数", 20)) if hd_second_pass else int(采样步数)
+        base_sigmas = g.node("BasicScheduler", model=sampling_model, scheduler=调度器, steps=first_steps, denoise=float(降噪强度))
         sigmas = base_sigmas.out(0)
         if sigma_enabled and fl_mode:
             # FL2VA不复用Ref2VA的整段低Sigma参数；仅在最后的非零→0区间增加1步。
@@ -780,7 +941,7 @@ class NanFengH3MultiReferenceGenerator:
                 ).out(0)
         # 关闭Sigma时仍是V3原来的单次原生采样路径。双采开启后，第二段从第一段latent
         # 无新增噪声接续；这是真正的两次SamplerCustomAdvanced，不是重复从头生成。
-        if sigma_enabled and bool(kwargs.get("启用双采样", False)):
+        if type(self) is NanFengH3MultiReferenceGeneratorV4 and sigma_enabled and bool(kwargs.get("启用双采样", False)):
             split = g.node("SplitSigmasDenoise", sigmas=sigmas, denoise=float(kwargs.get("双采后段比例", 0.5)))
             first = g.node(
                 "SamplerCustomAdvanced", noise=noise.out(0), guider=guider.out(0), sampler=sampler.out(0),
@@ -795,10 +956,188 @@ class NanFengH3MultiReferenceGenerator:
         else:
             # 使用和用户原始工作流完全相同的原生采样节点，排除自定义采样语义/显存差异。
             sampled = g.node("SamplerCustomAdvanced", noise=noise.out(0), guider=guider.out(0), sampler=sampler.out(0), sigmas=sigmas, latent_image=sampling_ready.out(2))
+        if hd_second_pass:
+            # 真正的高清二采：一采AV latent先解码视频、按目标MP放大、重新编码视频，
+            # 再把一采音频latent原样重组回NestedTensor，以独立低强度Sigma轨迹重绘。
+            first_released = g.node("NanFengH3ReleaseBeforeDecode", samples=sampled.out(0))
+            first_images = g.node("VAEDecode", samples=first_released.out(0), vae=video_vae.out(0))
+            upscaled = g.node(
+                "NanFengH3UpscaleForSecondPass", image=first_images.out(0),
+                megapixels=float(kwargs.get("二采百万像素", 1.0)),
+                method=str(kwargs.get("二采放大方法", "lanczos")),
+            )
+            encoded_video = g.node("VAEEncode", pixels=upscaled.out(0), vae=video_vae.out(0))
+            rebuilt = g.node(
+                "NanFengH3RebuildAVLatent", video_latent=encoded_video.out(0),
+                source_av_latent=first_released.out(0),
+            )
+            try:
+                import folder_paths
+                installed_models = folder_paths.get_filename_list("diffusion_models")
+            except Exception:
+                installed_models = []
+            second_model_name = _select_second_pass_model(
+                kwargs.get("二采模型", SECOND_MODEL_SAME), installed_models, bool(fl_mode), selected_model,
+            )
+            # 条件张量直接复用一采结果，所以文本编码器不会重复加载/编码。独立屏障只在
+            # 放大重编码完成后才卸载一采和VAE，然后加载用户选择的二采DiT，避免双模型并驻。
+            second_ready = g.node(
+                "NanFengH3ReleaseBeforeSecondModel", unet_name=second_model_name,
+                conditioning=sampling_ready.out(1), latent=rebuilt.out(0),
+            )
+            second_model = g.node(
+                "UNETLoader", unet_name=second_ready.out(0), weight_dtype=模型权重精度,
+            ).out(0)
+            if SageAttention != "disabled" and not (sol_enabled or t8_enabled):
+                second_model = g.node(
+                    "PathchSageAttentionKJ", model=second_model,
+                    sage_attention=SageAttention, allow_compile=bool(允许编译),
+                ).out(0)
+            if sigma_enabled:
+                second_model = g.node(
+                    "MiniMaxH3SigmaShift", model=second_model,
+                    shift_video=float(kwargs.get("视频西格玛偏移", 12.0)),
+                    shift_audio=float(kwargs.get("音频西格玛偏移", 3.0)),
+                ).out(0)
+            second_guider = g.node("BasicGuider", model=second_model, conditioning=second_ready.out(1))
+            second_sampler = g.node(
+                "KSamplerSelect", sampler_name=str(kwargs.get("二采采样器", "res_multistep")),
+            )
+            second_sigmas = g.node(
+                "BasicScheduler", model=second_model,
+                scheduler=str(kwargs.get("二采调度器", "simple")),
+                steps=int(kwargs.get("二采步数", 6)),
+                denoise=1.0,
+            )
+            second_sigmas = g.node(
+                "NanFengH3TrimSigmasAtStart", sigmas=second_sigmas.out(0),
+                start_sigma=float(kwargs.get("二采起始Sigma", kwargs.get("二采降噪", 0.2))),
+            )
+            sampled = g.node(
+                "SamplerCustomAdvanced", noise=noise.out(0), guider=second_guider.out(0),
+                sampler=second_sampler.out(0), sigmas=second_sigmas.out(0),
+                latent_image=second_ready.out(2),
+            )
         released = g.node("NanFengH3ReleaseBeforeDecode", samples=sampled.out(0))
         image_decode = g.node("VAEDecode", samples=released.out(0), vae=video_vae.out(0))
         audio_decode = g.node("VAEDecodeAudio", samples=released.out(0), vae=audio_vae.out(0))
-        return {"result": (image_decode.out(0), audio_decode.out(0)), "expand": g.finalize()}
+
+        legacy_face_refine = str(kwargs.get("启动准备", FACE_REFINE_OFF)) == FACE_REFINE_ON
+        single_face_refine = bool(kwargs.get("单人小脸修复", False))
+        multi_face_refine = bool(kwargs.get("多人小脸修复", False))
+        if single_face_refine and multi_face_refine:
+            raise ValueError("单人小脸修复与多人小脸修复只能开启一个，也可以全部关闭。")
+        face_refine_enabled = isinstance(self, NanFengH3MultiReferenceGeneratorV6) and (
+            legacy_face_refine or single_face_refine or multi_face_refine
+        )
+        final_images = image_decode.out(0)
+        if face_refine_enabled:
+            # 官方FaceRefine正确链路：成片逐帧追踪/裁剪 → 以追踪器动态画布重新建立
+            # Ref2VA条件容器 → 把真实crop编码进AV latent → 按脸尺寸设置逐帧noise mask →
+            # H3四步低强度重绘 → 解码 → 依照同一transform贴回原成片。
+            # 二次修复统一使用Ref2VA容器：它允许0张参考图；I2VA/FL2VA则复用首/尾图片
+            # 作为身份参考，但不把它们再次设成关键帧，避免局部crop被整帧构图强行拉扯。
+            try:
+                import folder_paths
+                refine_lora = _select_face_refine_turbo_lora(folder_paths.get_filename_list("loras"))
+            except ValueError:
+                raise
+            except Exception as exc:
+                raise ValueError(f"无法读取H3修脸Turbo LoRA列表：{exc}") from exc
+            identity_images = []
+            if multi_face_refine:
+                slots = [str(kwargs.get("人物1身份参考", "图片1")), str(kwargs.get("人物2身份参考", "图片2"))]
+                indices = [int(slot.replace("图片", "")) - 1 if slot.startswith("图片") else -1 for slot in slots]
+                positions = [str(kwargs.get("人物1图中位置", "自动（最大脸）")), str(kwargs.get("人物2图中位置", "自动（最大脸）"))]
+                if any(index < 0 or index >= len(image_names) or not image_names[index] for index in indices):
+                    raise ValueError("多人小脸修复需要从已上传素材中选择有效身份参考图。")
+                if indices[0] == indices[1] and positions[0] == positions[1]:
+                    raise ValueError("两人使用同一身份图时，必须选择同一张图中的不同人物位置。")
+                for index, position in zip(indices, positions):
+                    identity_load = g.node("LoadImage", image=image_names[index])
+                    identity_limited = g.node(
+                        "NanFengH3LimitImageLongEdge", image=identity_load.out(0), max_long_edge=1920,
+                    )
+                    identity_images.append(g.node(
+                        "H3SelectIdentityFace", image=identity_limited.out(0),
+                        detector="bbox\\face_yolov8m.pt", selection=position,
+                        confidence=0.35, padding=0.55,
+                    ).out(0))
+            elif fl_mode in {"图生视频", "首尾帧"} and image_count:
+                identity_images = [first_limited.out(0)]
+            else:
+                identity_images = [None]
+
+            # 多人模式逐人建立完整独立链，并把上一人的贴回结果交给下一人；单人仍只运行一次原逻辑。
+            for identity_image in identity_images:
+                tracker_inputs = {
+                    "images": final_images, "detector": "bbox\\face_yolov8m.pt",
+                    "confidence": 0.35, "crop_factor": 2.5, "canvas_width": 512, "canvas_height": 512,
+                    "canvas_mode": "auto_capped_768", "smooth_window": 11, "size_smooth_window": 81,
+                    "smooth_method": "gaussian", "size_mode": "per_frame", "identity_track": True,
+                    "identity_threshold": 0.28, "select": "largest", "fallback_detector": "none",
+                    "fallback_head_frac": 0.5,
+                }
+                if identity_image is not None:
+                    tracker_inputs["identity_reference"] = identity_image
+                tracker = g.node("H3FaceTrackCrop", **tracker_inputs)
+                refine_condition_inputs = {
+                    "clip": clip.out(0), "vae": video_vae.out(0), "audio_vae": audio_vae.out(0),
+                    "prompt": 提示词, "width": tracker.out(4), "height": tracker.out(5),
+                    "length": length, "ref_image_size": "max",
+                }
+                if multi_face_refine:
+                    # 每条链只接入本人的身份图，避免两个人在局部二采中互相串脸。
+                    refine_condition_inputs["ref_images.ref_image_0"] = identity_image
+                elif fl_mode in {"图生视频", "首尾帧"}:
+                    refine_condition_inputs["ref_images.ref_image_0"] = first_limited.out(0)
+                    if fl_mode == "首尾帧":
+                        refine_condition_inputs["ref_images.ref_image_1"] = last_limited.out(0)
+                elif not fl_mode:
+                    for key, value in condition_inputs.items():
+                        if key.startswith(("ref_images.", "ref_videos.", "ref_video_audios.", "ref_audios.")):
+                            refine_condition_inputs[key] = value
+                refine_prepared = g.node("MiniMaxH3ReferenceToVideo", **refine_condition_inputs)
+                injected = g.node(
+                    "H3InjectVideoLatent", av_latent=refine_prepared.out(1),
+                    images=tracker.out(0), vae=video_vae.out(0),
+                )
+                refine_model = g.node(
+                    "LoraLoaderModelOnly", model=sampling_model,
+                    lora_name=refine_lora, strength_model=0.75,
+                )
+                audio_locked = g.node(
+                    "MiniMaxH3NativeAudioLock", model=refine_model.out(0),
+                    av_latent=injected.out(0), audio_vae=audio_vae.out(0), audio=audio_decode.out(0),
+                )
+                per_frame = g.node(
+                    "H3PerFrameDenoise", av_latent=audio_locked.out(1), transform=tracker.out(1),
+                    strength_small_face=0.80, strength_large_face=0.30,
+                    scale_mode="absolute_px", face_px_small=30.0, face_px_large=120.0,
+                    gamma=1.0, smooth_frames=25,
+                )
+                refine_ready = g.node(
+                    "NanFengH3ReleaseBeforeSampling", model=audio_locked.out(0),
+                    conditioning=refine_prepared.out(0), latent=per_frame.out(0),
+                )
+                refine_guider = g.node("BasicGuider", model=refine_ready.out(0), conditioning=refine_ready.out(1))
+                refine_sigmas = g.node(
+                    "BasicScheduler", model=refine_ready.out(0), scheduler="simple", steps=4, denoise=0.32,
+                )
+                refine_sampled = g.node(
+                    "SamplerCustomAdvanced", noise=noise.out(0), guider=refine_guider.out(0),
+                    sampler=sampler.out(0), sigmas=refine_sigmas.out(0), latent_image=refine_ready.out(2),
+                )
+                refine_released = g.node("NanFengH3ReleaseBeforeDecode", samples=refine_sampled.out(0))
+                refined_crops = g.node("VAEDecode", samples=refine_released.out(0), vae=video_vae.out(0))
+                stitched = g.node(
+                    "H3FaceStitch", base_images=final_images, refined_crops=refined_crops.out(0),
+                    transform=tracker.out(1), paste_region="face_only", mask_dilation=24,
+                    feather=28, colour_match=1.0, blend=0.80,
+                    undetected_frames="fade_out", feather_scales_with_crop=False,
+                )
+                final_images = stitched.out(0)
+        return {"result": (final_images, audio_decode.out(0)), "expand": g.finalize()}
 
 
 class NanFengH3MultiReferenceGeneratorV2(NanFengH3MultiReferenceGenerator):
@@ -886,16 +1225,71 @@ class NanFengH3MultiReferenceGeneratorV4(NanFengH3MultiReferenceGeneratorV3):
     DESCRIPTION = "南风H3 V4：V3完整功能 + 可关闭的Sigma Shift、低Sigma加密、手动Sigma与双阶段采样。"
 
 
+class NanFengH3MultiReferenceGeneratorV5(NanFengH3MultiReferenceGeneratorV4):
+    """V5：以真正的解码→放大→重编码→独立低强度H3二采取代V4 Sigma双阶段采样。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        schema = super().INPUT_TYPES()
+        required = schema["required"]
+        # V5继续严格追加，V1-V4的序列化Widget位置完全不动；V4旧双阶段字段仅隐藏/忽略。
+        required["启用高清二采"] = ("BOOLEAN", {"default": False})
+        required["一采步数"] = ("INT", {"default": 20, "min": 1, "max": 100, "step": 1})
+        required["二采百万像素"] = (MEGAPIXELS, {"default": 1.0})
+        required["二采放大方法"] = (["lanczos", "bicubic", "bilinear", "nearest-exact"], {"default": "lanczos"})
+        required["二采步数"] = ("INT", {"default": 6, "min": 1, "max": 30, "step": 1})
+        required["二采降噪"] = ("FLOAT", {"default": 0.2, "min": 0.05, "max": 0.6, "step": 0.01})
+        required["二采采样器"] = (["res_multistep", "euler"], {"default": "res_multistep"})
+        required["二采调度器"] = (["simple", "beta"], {"default": "simple"})
+        try:
+            import folder_paths
+            installed = [x for x in folder_paths.get_filename_list("diffusion_models") if _is_h3_video_model(x)]
+        except Exception:
+            installed = []
+        required["二采模型"] = ([SECOND_MODEL_SAME, SECOND_MODEL_AUTO] + installed, {"default": SECOND_MODEL_SAME})
+        required["二采起始Sigma"] = ("FLOAT", {"default": 0.2, "min": 0.01, "max": 1.0, "step": 0.01})
+        return schema
+
+    DESCRIPTION = "南风H3 V5：V4完整功能 + 可选高清放大二采重绘；开启后主控步数失效，改用独立一采/二采步数。"
+
+
+class NanFengH3MultiReferenceGeneratorV6(NanFengH3MultiReferenceGeneratorV5):
+    """V6：V5完整功能 + 可选H3远景小脸追踪、局部重绘和时序贴回。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        schema = super().INPUT_TYPES()
+        # 旧下拉保留在原序列化位置，仅用于兼容已经保存的V6工作流；新界面使用两个互斥开关。
+        schema["required"]["启动准备"] = ([FACE_REFINE_OFF, FACE_REFINE_ON], {"default": FACE_REFINE_OFF})
+        schema["required"]["单人小脸修复"] = ("BOOLEAN", {"default": False})
+        schema["required"]["多人小脸修复"] = ("BOOLEAN", {"default": False})
+        identity_slots = [f"图片{i}" for i in range(1, 10)]
+        schema["required"]["人物1身份参考"] = (identity_slots, {"default": "图片1"})
+        schema["required"]["人物2身份参考"] = (identity_slots, {"default": "图片2"})
+        identity_positions = ["自动（最大脸）", "最左人物", "左起第2人", "左起第3人", "最右人物"]
+        schema["required"]["人物1图中位置"] = (identity_positions, {"default": "自动（最大脸）"})
+        schema["required"]["人物2图中位置"] = (identity_positions, {"default": "自动（最大脸）"})
+        return schema
+
+    DESCRIPTION = "南风H3 V6：V5完整功能 + 可关闭、单人或双人H3 FaceRefine小脸修复。"
+
+
 NODE_CLASS_MAPPINGS = {
     "NanFengH3MultiReferenceGenerator": NanFengH3MultiReferenceGenerator,
     "NanFengH3MultiReferenceGeneratorV2": NanFengH3MultiReferenceGeneratorV2,
     "NanFengH3MultiReferenceGeneratorV3": NanFengH3MultiReferenceGeneratorV3,
     "NanFengH3MultiReferenceGeneratorV4": NanFengH3MultiReferenceGeneratorV4,
+    "NanFengH3MultiReferenceGeneratorV5": NanFengH3MultiReferenceGeneratorV5,
+    "NanFengH3MultiReferenceGeneratorV6": NanFengH3MultiReferenceGeneratorV6,
     "NanFengH3ImageCanvasSize32": NanFengH3ImageCanvasSize32,
+    "NanFengH3UpscaleForSecondPass": NanFengH3UpscaleForSecondPass,
+    "NanFengH3RebuildAVLatent": NanFengH3RebuildAVLatent,
     "NanFengH3AddFinalSigmaStep": NanFengH3AddFinalSigmaStep,
+    "NanFengH3TrimSigmasAtStart": NanFengH3TrimSigmasAtStart,
     "NanFengH3LimitImageLongEdge": NanFengH3LimitImageLongEdge,
     "NanFengH3ReleaseAtStart": NanFengH3ReleaseAtStart,
     "NanFengH3ReleaseBeforeConditionLoaders": NanFengH3ReleaseBeforeConditionLoaders,
+    "NanFengH3ReleaseBeforeSecondModel": NanFengH3ReleaseBeforeSecondModel,
     "NanFengH3ReleaseBeforeConditioning": NanFengH3ReleaseBeforeConditioning,
     "NanFengH3ReleaseBeforeSampling": NanFengH3ReleaseBeforeSampling,
     "NanFengH3ReleaseBeforeDecode": NanFengH3ReleaseBeforeDecode,
@@ -905,6 +1299,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NanFengH3MultiReferenceGeneratorV2": "南风H3多参视频生成V2",
     "NanFengH3MultiReferenceGeneratorV3": "南风H3多参视频生成V3",
     "NanFengH3MultiReferenceGeneratorV4": "南风H3多参视频生成V4",
+    "NanFengH3MultiReferenceGeneratorV5": "南风H3多参视频生成V5",
+    "NanFengH3MultiReferenceGeneratorV6": "南风H3多参视频生成V6",
     "NanFengH3ImageCanvasSize32": "南风H3 原图比例画布尺寸",
     "NanFengH3AddFinalSigmaStep": "南风H3 FL2VA末段微量Sigma修复",
     "NanFengH3ReleaseAtStart": "南风H3 开始前释放显存",
