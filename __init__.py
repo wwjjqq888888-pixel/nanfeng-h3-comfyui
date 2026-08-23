@@ -4,6 +4,7 @@ from .nodes import NODE_CLASS_MAPPINGS as PROMPT_NODES
 from .nodes import NODE_DISPLAY_NAME_MAPPINGS as PROMPT_DISPLAY_NAMES
 from .h3_generator import NODE_CLASS_MAPPINGS as H3_NODES
 from .h3_generator import NODE_DISPLAY_NAME_MAPPINGS as H3_DISPLAY_NAMES
+from . import storyboard_api as _storyboard_api
 
 NODE_CLASS_MAPPINGS = {**PROMPT_NODES, **H3_NODES}
 NODE_DISPLAY_NAME_MAPPINGS = {**PROMPT_DISPLAY_NAMES, **H3_DISPLAY_NAMES}

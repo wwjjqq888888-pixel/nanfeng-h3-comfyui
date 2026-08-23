@@ -1,5 +1,5 @@
-# Security Policy
+# Security
 
-Do not attach API keys, private checkpoints, proprietary media, account tokens, or unsanitized ComfyUI workflows to public issues.
+Never commit `.env`, API keys, visual-analysis caches, local media, or model weights.
 
-For reproducible bug reports, replace private paths and media with non-sensitive test assets and include only environment versions and terminal errors.
+V8.1 keeps provider credentials server-side in `nanfeng_prompt_nodes/.env`; workflow JSON and frontend configuration responses do not expose key values. Use `.env.example` as the template.

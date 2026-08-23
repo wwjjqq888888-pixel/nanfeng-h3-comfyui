@@ -1,0 +1,1 @@
+# No extra pip dependency beyond the compatible ComfyUI H3 environment.

@@ -1,5 +1,3 @@
-# English documentation moved to the bilingual homepage
+# NanFeng H3 V8.1
 
-The repository homepage now contains complete Chinese and English documentation, screenshots, and the Seedance 2-like interaction explanation.
-
-Please read [README.md](README.md#english).
+The complete English guide is included in [README.md](README.md#english).

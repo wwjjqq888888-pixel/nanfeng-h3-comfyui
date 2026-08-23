@@ -1,0 +1,13 @@
+南风H3 V8.1 模型放置说明
+
+主模型：ComfyUI/models/diffusion_models/H3/
+文本编码器：ComfyUI/models/text_encoders/
+视频/音频VAE：ComfyUI/models/vae/
+H3 3D潜空间放大模型：ComfyUI/models/latent_upscale_models/
+H3 LoRA：ComfyUI/models/loras/H3/
+
+Ref2VA应选Ref2VA主模型和Ref2V LoRA；FL2VA应选FL2VA主模型和FL2V LoRA。
+V8.1一采、二采共用同一主模型、完整LoRA链与注意力链。
+4步Turbo LoRA强度先以1.0作为固定Seed A/B基线。
+预留显存会减少可用GPU预算，不是增加显存。
+模型文件不包含在本包中。

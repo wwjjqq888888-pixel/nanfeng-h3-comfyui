@@ -1,3 +1,0 @@
-ultralytics
-scipy
-insightface
