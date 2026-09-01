@@ -1,57 +1,69 @@
-# 南风 H3 V8.1 for ComfyUI / NanFeng H3 V8.1 for ComfyUI
+# 南风 H3 V10 for ComfyUI / NanFeng H3 V10 for ComfyUI
 
-> MiniMax H3 的非官方 ComfyUI 一体化节点。V8.1保留旧节点ID兼容，并加入连续Sigma一/二采、同一ModelPatcher与LoRA链、官方完整3D潜空间放大，以及智能分镜。
+> **一个节点，串起多参考素材、智能分镜、音频驱动与连续二采。** 这是我为 MiniMax H3 制作的非官方 ComfyUI 一体化工作台：把原本分散的模型、LoRA、参考图/视频/音频、提示词分段、Sigma 与二采参数收进同一块高密度节点界面。
 >
-> An unofficial all-in-one ComfyUI node suite for MiniMax H3. V8.1 keeps legacy node IDs and adds a continuous first/second-pass Sigma trajectory, shared ModelPatcher/LoRA chain, official full 3D latent upscaling, and smart storyboards.
+> **One node for multi-reference media, AI storyboards, audio-driven segmentation, and continuous second-pass generation.** This is my unofficial all-in-one ComfyUI workstation for MiniMax H3, bringing models, LoRAs, image/video/audio references, segmented prompts, Sigma controls, and second-pass settings into one dense node UI.
 
-**非官方项目 / Unofficial project.** 不包含MiniMax、Seedance或第三方模型权重，也不代表任何官方合作。
+**非官方项目 / Unofficial project.** 本仓库不包含模型权重，不隶属于、不代表也未获得 MiniMax、ComfyUI 或其他第三方的官方背书。
 
-## V8.1重点功能
+[中文说明](#中文说明) · [English](#english) · [下载 Release](https://github.com/wwjjqq888888-pixel/nanfeng-h3-comfyui/releases/latest)
 
-- 搜索标题：`南风H3 V8.1 多参视频生成（6+4同LoRA）`
-- 一采、二采共享同一主模型、完整LoRA链、强度和注意力链。
-- 一条连续Sigma轨迹；支持手动完整Sigma和独立的一采手动Sigma开关。
-- 保留官方完整3D潜空间放大和完整Temporal推理，不做非官方时间切块。
-- 统一一采/二采MP尺寸，显示实际宽高和latent网格对齐。
-- 参考图片最长边可选1280、1536、1920；智能分镜单张图片最大30 MiB。
-- 智能分镜：独立视觉/语言模型、服务端`.env`、1–12段、精确时长、结果追加不覆盖。
-- API仅对真实网络/上游临时故障重试；成功但本地解析失败不会重复付费生成。
-- “你想拍什么”独立保存原始中文自然语言；生成的英文分镜不会覆盖它，只同步素材。
-- 智能分镜内部支持换图、删除、拖动换位和`↔`点击换位，并同步固定`@图片N`槽位。
-- 同画布从当前分镜开始依次提交当前及后续非空分镜。
-- V8.1已移除FaceRefine执行链；旧序列化字段仅保留为惰性兼容占位。
+## 实机界面 / Real UI
 
-## 安装或覆盖升级
+下图来自实际运行中的 ComfyUI V10 工作流；截图经过裁切，不含 API Key、私人路径或私有媒体。
 
-进入`ComfyUI/custom_nodes/`：
+The images below come from a live ComfyUI V10 workflow. They are cropped to exclude API keys, private paths, and private media.
+
+| 主工作区 / Main workspace | 模型与尺寸控制 / Model & size controls |
+|---|---|
+| ![南风 H3 V10 主工作区](docs/assets/nanfeng-h3-v10-main-node.png) | ![南风 H3 V10 控制区](docs/assets/nanfeng-h3-v10-controls.png) |
+
+---
+
+# 中文说明
+
+## V10 有什么
+
+- **多参考统一工作区**：在同一节点组织图片、视频、音频与分段提示词，保持固定素材槽位和引用关系。
+- **智能分镜**：视觉模型与文本模型独立配置；原始创意独立保存，生成结果追加而不覆盖；支持分段、换图、删除、拖动换位和顺序提交。
+- **智能音频驱动**：音频与内部分镜一一对应；按段裁切，末段可向上取整并补静音；音频驱动 API 使用独立配置，不与普通智能分镜凭据混用。
+- **NativeAudioLock**：锁音频时直接输出精确源音频区间；未满足音频锁定条件时阻止错误生成。
+- **连续一采/二采**：共享 ModelPatcher、动态 LoRA 链、强度与注意力链；支持完整 Sigma 轨迹、独立一采 Sigma 和潜空间二采。
+- **Sigma 预设**：内置预设受保护，自定义预设可新建、切换、持久化和删除，并同步可见文本、底层值与采样步数。
+- **恒定触发词**：独立单行输入；每段按“恒定触发词 + 单换行 + 分镜提示词”组合，留空时不会产生顶头空行。
+- **可移植运行时**：Skill、前端资源和配置均按节点目录相对解析，不依赖作者机器的绝对路径。
+- **双 Skill 边界**：常规智能分镜 Skill 与 NS 分镜 Skill 作为两个独立目录随 V10 发布；请根据自己的使用场景、平台规则与当地法律合规使用。
+
+## 节点
+
+- 节点 ID：`NanFengH3MultiReferenceGeneratorV10`
+- 搜索标题：`南风H3 V10 多参视频生成`
+- 界面语言：**中文优先**，目前没有完整的运行时中英文切换。
+- 提示词输入：可输入中文或英文；最终理解质量取决于所连接的模型。
+
+## 安装
+
+进入 `ComfyUI/custom_nodes/` 后执行：
 
 ```bash
-git clone https://github.com/wwjjqq888888-pixel/nanfeng-h3-comfyui.git nanfeng_prompt_nodes
+git clone https://github.com/wwjjqq888888-pixel/nanfeng-h3-comfyui.git nanfeng_prompt_nodes_v10
 ```
 
-已有旧版时，先确认ComfyUI没有运行任务并退出，然后将Release ZIP里的`nanfeng_prompt_nodes`覆盖到：
+然后重启 ComfyUI，并在浏览器中执行 `Ctrl+F5` 强制刷新。
 
-```text
-ComfyUI/custom_nodes/nanfeng_prompt_nodes
-```
+### 从旧版覆盖升级
 
-V8.1安全升级ZIP不包含`.env`，所以不会删除已有API配置。首次安装时，把`.env.example`复制为`.env`并填写自己的配置。重启ComfyUI后用`Ctrl+F5`强制刷新。
+1. 等待当前任务结束并退出 ComfyUI。
+2. 下载最新 Release 中的升级 ZIP。
+3. 将 ZIP 内唯一顶层目录 `nanfeng_prompt_nodes_v10` 覆盖到 `ComfyUI/custom_nodes/`。
+4. Release ZIP **不包含** `.env`、`.audio-drive.env` 或视觉分析缓存，不会抹掉你现有的本地凭据。
+5. 重启 ComfyUI，执行 `Ctrl+F5`。
 
-## ComfyUI V15整合包（夸克网盘）
+> V10 使用独立目录名 `nanfeng_prompt_nodes_v10`。若你保留旧版做 A/B，请避免同时加载会注册相同节点 ID 的重复副本。
 
-完整整合包较大，GitHub只托管节点源码和轻量升级ZIP。V15整合包下载：
+## API 配置
 
-- 夸克网盘：https://pan.quark.cn/s/e0a7dbfea025?pwd=kqtU
-- 提取码：`kqtU`
-- 分享目录：`comfyuiV15`
-
-**覆盖规则：**整合包使用者下载后，请再使用本仓库最新Release中的`nanfeng_prompt_nodes`覆盖整合包内：
-
-```text
-ComfyUI/custom_nodes/nanfeng_prompt_nodes
-```
-
-这样可确保整合包中的节点升级为GitHub当前V8.1版本，同时不会覆盖用户自己的`.env`。
+首次安装可把 `.env.example` 复制为 `.env`，再填写你自己的视觉与文本模型配置。智能音频驱动的独立配置由节点界面写入本地 `.audio-drive.env`。这些真实配置文件均被 Git 和 Release 排除。
 
 ## 模型目录
 
@@ -60,54 +72,84 @@ ComfyUI/models/diffusion_models/H3/       # H3 Ref2VA / FL2VA
 ComfyUI/models/text_encoders/             # MiniMax H3 text encoder
 ComfyUI/models/vae/                       # H3 video VAE + audio VAE
 ComfyUI/models/latent_upscale_models/     # H3 3D latent upscaler
-ComfyUI/models/loras/H3/                  # Optional matching H3 LoRAs
+ComfyUI/models/loras/H3/                  # 可选 H3 LoRA
 ```
 
-Ref2VA请匹配Ref2V LoRA；FL2VA请匹配FL2V LoRA。4步Turbo LoRA可先用强度1.0做固定Seed基线。
+模型权重不随本仓库提供。请自行确认所用模型、LoRA 与 ComfyUI 扩展的许可证和兼容性。
+
+## 语言支持
+
+| 项目 | 状态 |
+|---|---|
+| 仓库文档 | 中文 + English |
+| 节点 UI | 中文优先；暂无完整语言切换 |
+| 提示词输入 | 支持中文或英文文本 |
+| `@图片N` 等快捷引用 | 中文优先语法 |
+| 模型理解效果 | 由用户选择的上游模型决定 |
 
 ## 隐私与安全
 
-仓库和Release不包含：模型、生成媒体、视觉分析缓存、测试缓存、作者`.env`或API Key。API Key只保存在节点目录服务端`.env`，不会写入工作流JSON。
+仓库和 Release 不包含模型、生成媒体、`.env`、`.audio-drive.env`、API Key、视觉分析缓存、`__pycache__` 或测试缓存。密钥只保存在用户本机节点目录的服务端配置中，不写入工作流 JSON。
 
 ---
 
 # English
 
-## Highlights
+## What V10 includes
 
-- Continuous first/second-pass Sigma trajectory with one shared final ModelPatcher, complete LoRA chain, strengths, and attention chain.
-- Official full 3D latent upscaler and full temporal inference remain intact; no unofficial temporal chunking.
-- Unified MP sizing with visible dimensions and latent-grid alignment.
-- Smart storyboard with separate vision/text providers, server-side `.env`, exact duration, append-only results, and same-canvas sequential queueing.
-- Genuine transient failures may retry; successful paid responses that fail local parsing are never generated again.
-- The original natural-language idea is stored independently and is not overwritten by generated storyboard prompts; only media slots synchronize.
-- Modal image replacement, deletion, drag reorder, click-to-swap, and stable `@Picture N` slot semantics.
-- V8.1 has no FaceRefine execution path; legacy serialized fields are inert compatibility placeholders only.
+- **Unified multi-reference workspace:** organize image, video, audio, and segmented prompts inside one node while preserving stable media slots and references.
+- **AI storyboard:** separate vision/text providers, independently preserved source idea, append-only generated results, segmented generation, image replacement/deletion/reordering, and sequential submission.
+- **Audio-driven storyboards:** one audio interval per internal storyboard segment, per-segment slicing, optional rounded final duration with silence padding, and credentials isolated from the regular storyboard backend.
+- **NativeAudioLock:** emits the exact source-audio interval when locked and blocks invalid generation when the audio-lock contract is incomplete.
+- **Continuous first/second pass:** shared ModelPatcher, dynamic LoRA stack, strengths, attention chain, full Sigma trajectory, independent first-pass Sigma, and latent second-pass controls.
+- **Persistent Sigma presets:** protected built-ins plus creatable, selectable, persistent, and deletable custom presets synchronized with visible values and sampling steps.
+- **Constant trigger line:** prepends one stable line to every segment with exactly one newline and no leading blank line when empty.
+- **Portable runtime:** Skills, frontend assets, and configuration paths resolve relative to the installed node directory—no author-specific absolute source path.
+- **Two explicit Skill scopes:** the regular storyboard Skill and NS storyboard Skill ship as separate directories. Use them only in compliance with your platform rules and local law.
 
-## Installation
+## Node identity
 
-Clone directly into the required custom-node directory:
+- Node ID: `NanFengH3MultiReferenceGeneratorV10`
+- Search title: `南风H3 V10 多参视频生成`
+- Runtime UI: **Chinese-first**; there is no complete runtime language switch yet.
+- Prompt input: Chinese or English text is accepted; comprehension quality depends on the connected model.
+
+## Install
+
+Run inside `ComfyUI/custom_nodes/`:
 
 ```bash
-git clone https://github.com/wwjjqq888888-pixel/nanfeng-h3-comfyui.git nanfeng_prompt_nodes
+git clone https://github.com/wwjjqq888888-pixel/nanfeng-h3-comfyui.git nanfeng_prompt_nodes_v10
 ```
 
-For an in-place upgrade, exit ComfyUI with no active jobs and overwrite the existing `ComfyUI/custom_nodes/nanfeng_prompt_nodes` with the Release ZIP folder. The upgrade archive excludes `.env`, preserving existing API credentials. First-time users should copy `.env.example` to `.env`.
+Restart ComfyUI and press `Ctrl+F5` in the browser.
 
-## Full ComfyUI V15 bundle
+### In-place upgrade
 
-The large full bundle is hosted on Quark Drive, while GitHub carries source and the lightweight upgrade archive:
+1. Let active jobs finish and exit ComfyUI.
+2. Download the latest Release ZIP.
+3. Extract its single top-level `nanfeng_prompt_nodes_v10` directory into `ComfyUI/custom_nodes/`, overwriting the previous V10 folder.
+4. The upgrade archive excludes `.env`, `.audio-drive.env`, and vision caches, so existing local credentials survive.
+5. Restart ComfyUI and press `Ctrl+F5`.
 
-- https://pan.quark.cn/s/e0a7dbfea025?pwd=kqtU
-- Extraction code: `kqtU`
-- Shared folder: `comfyuiV15`
+## API configuration
 
-After installing the full bundle, overwrite its `ComfyUI/custom_nodes/nanfeng_prompt_nodes` with the latest GitHub Release package.
+For a clean install, copy `.env.example` to `.env` and enter your own vision/text provider settings. Audio-drive credentials use a separate local `.audio-drive.env` managed by the node UI. Live configuration files are excluded from Git and Release assets.
 
-## Privacy
+## Language support
 
-No model weights, generated media, visual-analysis cache, live `.env`, or API keys are included. Credentials remain server-side in the recipient's own `.env` and are never serialized into workflow JSON.
+| Surface | Support |
+|---|---|
+| Repository documentation | Chinese + English |
+| Runtime node UI | Chinese-first; no complete language switch yet |
+| Prompt input | Chinese or English text |
+| Shortcuts such as `@图片N` | Chinese-first syntax |
+| Model comprehension | Depends on the user's selected upstream model |
 
-## Historical versions
+## Privacy, limitations, and licenses
 
-V6 remains available through tag and Release `v6.0.0`. V8.1 is the current main branch and latest Release.
+No model weights, generated media, live credentials, vision-analysis cache, bytecode, or test cache are included. This extension depends on a compatible ComfyUI + MiniMax H3 environment. Model weights, ComfyUI, and third-party extensions retain their own licenses; this repository does not grant rights to redistribute them.
+
+## Historical releases
+
+V8.1, V6, and V4 remain available as historical tags and Releases. V10 is the current `main` branch and latest Release.

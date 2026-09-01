@@ -1,1 +1,2 @@
-# No extra pip dependency beyond the compatible ComfyUI H3 environment.
+# V10 uses only dependencies already provided by a compatible ComfyUI + MiniMax H3 environment.
+# numpy, torch, and torchaudio are expected to come from that environment.

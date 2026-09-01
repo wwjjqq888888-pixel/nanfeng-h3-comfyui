@@ -34,6 +34,7 @@ _JOB_LOCK = threading.Lock()
 CONFIG_FIELDS = (
     "NANFENG_VISION_BASE_URL", "NANFENG_VISION_API_KEY", "NANFENG_VISION_MODEL", "NANFENG_VISION_PROTOCOL",
     "NANFENG_TEXT_BASE_URL", "NANFENG_TEXT_API_KEY", "NANFENG_TEXT_MODEL", "NANFENG_TEXT_PROTOCOL",
+    "NANFENG_TEXT_NS_STORYBOARD_BASE_URL", "NANFENG_TEXT_NS_STORYBOARD_API_KEY", "NANFENG_TEXT_NS_STORYBOARD_MODEL", "NANFENG_TEXT_NS_STORYBOARD_PROTOCOL",
 )
 CONFIG_PUBLIC_FIELDS = (
     "NANFENG_VISION_BASE_URL", "NANFENG_VISION_MODEL",
@@ -46,6 +47,26 @@ STORYBOARD_MODES = {
     "t2va": "T2V 文生视频",
     "fl2va": "首尾帧 FL2VA",
 }
+PORTABLE_NS_SKILL_PATH = ROOT / "ns-storyboard-skill" / "SKILL.md"
+SKILL_PROFILES = {
+    "regular_storyboard": {"label": "常规提示词分镜", "description": "根据参考素材生成标准连续分镜提示词。", "skill_path": SKILL_PATH, "legacy_text_keys": True},
+    "ns_storyboard": {"label": "NS提示词分镜", "description": "使用NS提示词分镜Skill生成连续分镜。", "skill_path": PORTABLE_NS_SKILL_PATH, "legacy_text_keys": False},
+}
+
+
+def skill_profile(skill_id: str | None = None) -> tuple[str, dict]:
+    requested = str(skill_id or "regular_storyboard").strip()
+    if requested not in SKILL_PROFILES:
+        raise ValueError("提示词Skill无效")
+    return requested, SKILL_PROFILES[requested]
+
+
+def skill_text_keys(skill_id: str) -> tuple[str, str, str, str]:
+    key, profile = skill_profile(skill_id)
+    if profile.get("legacy_text_keys"):
+        return ("NANFENG_TEXT_BASE_URL", "NANFENG_TEXT_API_KEY", "NANFENG_TEXT_MODEL", "NANFENG_TEXT_PROTOCOL")
+    suffix = re.sub(r"[^A-Z0-9]+", "_", key.upper()).strip("_")
+    return tuple(f"NANFENG_TEXT_{suffix}_{name}" for name in ("BASE_URL", "API_KEY", "MODEL", "PROTOCOL"))
 
 
 class TransientAPIError(RuntimeError):
@@ -124,24 +145,31 @@ def load_env(path: Path = ENV_PATH) -> dict[str, str]:
     return values
 
 
-def config_status(env: dict[str, str] | None = None) -> dict:
+def config_status(env: dict[str, str] | None = None, skill_id: str = "regular_storyboard") -> dict:
     cfg = env or load_env()
+    skill_profile(skill_id)
     vision = all(cfg.get(k, "").strip() for k in (
         "NANFENG_VISION_API_KEY", "NANFENG_VISION_BASE_URL", "NANFENG_VISION_MODEL"
     ))
-    text = all(cfg.get(k, "").strip() for k in (
-        "NANFENG_TEXT_API_KEY", "NANFENG_TEXT_BASE_URL", "NANFENG_TEXT_MODEL"
-    ))
-    return {"vision_configured": vision, "text_configured": text, "skill_exists": SKILL_PATH.exists()}
+    text_keys = skill_text_keys(skill_id)
+    text = all(cfg.get(k, "").strip() for k in text_keys[:3])
+    return {"vision_configured": vision, "text_configured": text, "skill_exists": SKILL_PATH.exists(), "skill_id": skill_id}
 
 
-def config_for_browser(env: dict[str, str] | None = None) -> dict:
-    """Return editable non-secret fields and only booleans for stored keys."""
+def config_for_browser(env: dict[str, str] | None = None, skill_id: str = "regular_storyboard") -> dict:
+    """Return editable non-secret fields for the selected Skill; secrets remain booleans."""
     cfg = env or load_env()
-    result = config_status(cfg)
-    result.update({key: cfg.get(key, "") for key in CONFIG_PUBLIC_FIELDS})
+    key, profile = skill_profile(skill_id)
+    text_base, text_key, text_model, text_protocol = skill_text_keys(key)
+    result = config_status(cfg, key)
+    result.update({key: cfg.get(key, "") for key in ("NANFENG_VISION_BASE_URL", "NANFENG_VISION_MODEL", text_base, text_model)})
+    result["NANFENG_TEXT_BASE_URL"] = cfg.get(text_base, "")
+    result["NANFENG_TEXT_MODEL"] = cfg.get(text_model, "")
     result["vision_key_saved"] = bool(cfg.get("NANFENG_VISION_API_KEY", "").strip())
-    result["text_key_saved"] = bool(cfg.get("NANFENG_TEXT_API_KEY", "").strip())
+    result["text_key_saved"] = bool(cfg.get(text_key, "").strip())
+    result["skill_label"] = profile["label"]
+    result["skill_description"] = profile["description"]
+    result["skills"] = [{"id": item_id, "label": item["label"], "description": item["description"]} for item_id, item in SKILL_PROFILES.items()]
     return result
 
 
@@ -172,7 +200,7 @@ def _validate_config_payload(payload: dict) -> dict[str, str]:
         if "\n" in value or "\r" in value:
             raise ValueError(f"{key}不能包含换行")
         values[key] = value
-    for key in ("NANFENG_VISION_BASE_URL", "NANFENG_TEXT_BASE_URL"):
+    for key in ("NANFENG_VISION_BASE_URL", "NANFENG_TEXT_BASE_URL", "NANFENG_TEXT_NS_STORYBOARD_BASE_URL"):
         value = values.get(key)
         if value and not re.match(r"^https?://", value, re.I):
             raise ValueError(f"{key}必须以http://或https://开头")
@@ -186,9 +214,17 @@ def _validate_config_payload(payload: dict) -> dict[str, str]:
 
 
 def save_config(payload: dict, path: Path = ENV_PATH) -> dict:
-    """Atomically update package .env; blank key means retain the stored key."""
+    """Atomically update package .env; browser text fields map to the selected Skill."""
     current = load_env(path)
-    values = _validate_config_payload(payload)
+    skill_id, _profile = skill_profile(payload.get("skill_id", "regular_storyboard"))
+    text_base, text_key, text_model, text_protocol = skill_text_keys(skill_id)
+    normalized = dict(payload)
+    if skill_id != "regular_storyboard":
+        for generic, selected in (("NANFENG_TEXT_BASE_URL", text_base), ("NANFENG_TEXT_API_KEY", text_key), ("NANFENG_TEXT_MODEL", text_model)):
+            if generic in normalized:
+                normalized[selected] = normalized[generic]
+                normalized.pop(generic, None)
+    values = _validate_config_payload(normalized)
     for key, value in values.items():
         if key.endswith("_API_KEY") and not value:
             continue
@@ -203,7 +239,7 @@ def save_config(payload: dict, path: Path = ENV_PATH) -> dict:
     temp = path.with_suffix(path.suffix + ".tmp")
     temp.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     os.replace(temp, path)
-    return config_for_browser(current)
+    return config_for_browser(current, payload.get("skill_id", "regular_storyboard"))
 
 
 def clear_config(path: Path = ENV_PATH) -> dict:
@@ -422,9 +458,9 @@ def validate_mode(mode: str, images: list[dict]) -> str:
 
 
 def mode_contract(mode: str, count: int) -> str:
-    common = f"严格输出{count}段。从段1开始依次编号到段{count}；每个标题行只能写对应的‘段N’，不得写‘段1到段{count}’或其他文字。段之间用---分隔。每段必须是可直接复制使用的完整官方提示词。"
+    common = f"严格输出{count}段。从段1开始依次编号到段{count}；每个标题行只能写对应的‘段N’，不得写‘段1到段{count}’或其他文字。段之间用---分隔。每段必须是可直接复制使用的完整官方提示词。相邻两段必须作为一个整体联合设计：先联合规划段N尾镜与段N+1首镜，再分别写入两段。下一段首镜继承上一段尾镜的站位关系、前中后景、左右位置、朝向、视线、距离、遮挡、动作阶段、道具状态和180度动作轴；切镜只改变观察位置，不改变世界状态。跨段边界必须形成可剪辑的镜头变化，优先用动作轴内的正反打、反应镜头，或有动机的景别/机位变化；除非用户明确要求连续同镜头，段N尾镜与段N+1首镜不得使用相同景别且相同机位角度。不得为了变化而瞬移、越轴、左右互换、重置动作或跳过动作。下一段第一帧就必须落在上一段尾镜的状态：不得先闪出默认构图、参考图原始姿势、错误人数或错误机位，不得重新建立人物站位或让动作重新起势；换景别或换角度只能发生在状态继承成立之后，并保持人物数量、唯一实例、接触点、遮挡、动作相位、光线和轴线连续。"
     if mode == "ref2va":
-        return common + "当前模式为Ref2VA多参。每段严格依次输出subject_definitions、summary、retention_analysis、detailed_description、overall_soundscape、non_diegetic_music六段，使用<Subject N>/<Picture N>。"
+        return common + "当前模式为Ref2VA多参。Ref2VA多参素材只提供身份、外观、场景、道具、风格或动作参考，不锁定任何Picture为0.00秒首帧；不得在段首先闪现或完整展示任一参考素材的原始画面，不得轮播、拼贴或从参考图原始构图/姿势起步。每段00:00直接生成该段目标剧情构图：第一段直接进入用户要求的开场，后续段直接生成承接上一段尾镜世界状态的目标画面；所有素材从第一帧起按各自语义职责融合。每段严格依次输出subject_definitions、summary、retention_analysis、detailed_description、overall_soundscape、non_diegetic_music六段，使用<Subject N>/<Picture N>。"
     if mode == "i2va":
         return common + "当前模式为I2VA图生视频。每段先写@图片1对应Picture 1在0.00秒的官方首帧对齐句，再依次输出integrated_multimodal_description、overall_soundscape、non_diegetic_music。"
     if mode == "fl2va":
@@ -472,7 +508,10 @@ def parse_storyboard(text: str, count: int) -> dict:
     return {"global": global_prompt, "segments": segments, "raw": raw}
 
 
-def load_storyboard_skill(mode: str = "ref2va") -> str:
+def load_storyboard_skill(mode: str = "ref2va", skill_id: str = "regular_storyboard") -> str:
+    selected_path = skill_profile(skill_id)[1]["skill_path"]
+    if selected_path.exists() and skill_id == "ns_storyboard":
+        return selected_path.read_text(encoding="utf-8")
     if not SKILL_PATH.exists():
         return "输出适合MiniMax H3官方结构的连续视频提示词。"
     sections = [SKILL_PATH.read_text(encoding="utf-8")]
@@ -491,7 +530,9 @@ def storyboard_output_budget(segment_count: int) -> int:
 
 async def generate_storyboard(payload: dict, cfg: dict[str, str] | None = None) -> dict:
     config = cfg or load_env()
-    status = config_status(config)
+    skill_id, profile = skill_profile(payload.get("skill_id", "regular_storyboard"))
+    text_base_key, text_api_key, text_model_key, text_protocol_key = skill_text_keys(skill_id)
+    status = config_status(config, skill_id)
     if not status["text_configured"]:
         raise ValueError("语言模型API尚未在节点包.env完整配置")
     count = int(payload.get("segment_count", 1))
@@ -507,13 +548,13 @@ async def generate_storyboard(payload: dict, cfg: dict[str, str] | None = None) 
     mode = validate_mode(payload.get("mode", "ref2va"), images)
     if images and not status["vision_configured"]:
         raise ValueError("已添加图片，但看图API尚未在节点包.env完整配置")
-    skill = load_storyboard_skill(mode)
+    skill = load_storyboard_skill(mode) if skill_id == "regular_storyboard" else load_storyboard_skill(mode, skill_id)
     analysis = await analyze_images(images, config) if images else ""
     messages = storyboard_messages(skill, str(payload.get("idea", "")).strip(), count, images, analysis, mode, duration_seconds)
     result = await asyncio.to_thread(
         request_model,
-        config["NANFENG_TEXT_BASE_URL"], config["NANFENG_TEXT_API_KEY"], config["NANFENG_TEXT_MODEL"], messages,
-        protocol=config.get("NANFENG_TEXT_PROTOCOL", "chat_completions"), temperature=0.7, timeout=600,
+        config.get(text_base_key, ""), config.get(text_api_key, ""), config.get(text_model_key, ""), messages,
+        protocol=config.get(text_protocol_key, "chat_completions"), temperature=0.7, timeout=600,
         max_output_tokens=storyboard_output_budget(count), disable_reasoning=True,
     )
     parsed = parse_storyboard(result, count)
@@ -533,25 +574,25 @@ def register_routes() -> None:
         return
     routes = prompt_server.routes
 
-    @routes.get("/nanfeng/h3/storyboard/config")
-    async def get_config(_request):
-        return web.json_response(config_for_browser())
+    @routes.get("/nanfeng/v10/h3/storyboard/config")
+    async def get_config(request):
+        return web.json_response(config_for_browser(skill_id=request.query.get("skill_id", "regular_storyboard")))
 
-    @routes.post("/nanfeng/h3/storyboard/config")
+    @routes.post("/nanfeng/v10/h3/storyboard/config")
     async def update_config(request):
         try:
             return web.json_response({"ok": True, **save_config(await request.json())})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
 
-    @routes.delete("/nanfeng/h3/storyboard/config")
+    @routes.delete("/nanfeng/v10/h3/storyboard/config")
     async def delete_config(_request):
         try:
             return web.json_response({"ok": True, **clear_config()})
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
 
-    @routes.post("/nanfeng/h3/storyboard/models")
+    @routes.post("/nanfeng/v10/h3/storyboard/models")
     async def discover_models(request):
         try:
             payload = await request.json()
@@ -567,7 +608,7 @@ def register_routes() -> None:
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
 
-    @routes.post("/nanfeng/h3/storyboard/generate")
+    @routes.post("/nanfeng/v10/h3/storyboard/generate")
     async def generate(request):
         try:
             payload = await request.json()
@@ -575,7 +616,7 @@ def register_routes() -> None:
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
 
-    @routes.post("/nanfeng/h3/storyboard/jobs")
+    @routes.post("/nanfeng/v10/h3/storyboard/jobs")
     async def create_job(request):
         job_id = uuid.uuid4().hex
         job = StoryboardJob(job_id, await request.json())
@@ -584,14 +625,14 @@ def register_routes() -> None:
         threading.Thread(target=_run_storyboard_job, args=(job,), daemon=True, name=f"nanfeng-storyboard-{job_id[:8]}").start()
         return web.json_response({"ok": True, "job_id": job_id})
 
-    @routes.get("/nanfeng/h3/storyboard/jobs/{job_id}")
+    @routes.get("/nanfeng/v10/h3/storyboard/jobs/{job_id}")
     async def get_job(request):
         job = _STORYBOARD_JOBS.get(request.match_info["job_id"])
         if job is None:
             return web.json_response({"ok": False, "error": "任务不存在"}, status=404)
         return web.json_response({"ok": True, **job.public()})
 
-    @routes.delete("/nanfeng/h3/storyboard/jobs/{job_id}")
+    @routes.delete("/nanfeng/v10/h3/storyboard/jobs/{job_id}")
     async def cancel_job(request):
         job = _STORYBOARD_JOBS.get(request.match_info["job_id"])
         if job is None:

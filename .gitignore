@@ -1,5 +1,12 @@
 .env
+.audio-drive.env
 .vision-analysis-cache.json
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.coverage
+htmlcov/
+.DS_Store
+Thumbs.db
+*.zip
+*.sha256

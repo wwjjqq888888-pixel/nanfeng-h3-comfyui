@@ -8,16 +8,7 @@ from collections import OrderedDict
 
 CATEGORY = "南风节点/视频生成"
 FPS = 24
-DEFAULT_MODEL_OPTIONS = [
-    "H3/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
-    "H3/minimax_h3_ref2va_int8_convrot.safetensors",
-    "H3/minimax_h3_ref2va_bf16.safetensors",
-]
-FL2VA_MODEL_NAME = "minimax_h3_fl2va_int8_convrot.safetensors"
-# 与 Downloads/video_minimax_h3_r2v.json 官方本地工作流保持一致。
-DEFAULT_TEXT_ENCODER = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
-DEFAULT_VIDEO_VAE = "minimax_h3_video_vae_fp16.safetensors"
-DEFAULT_AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
+
 SAGE_MODES = [
     "disabled", "auto", "sageattn_qk_int8_pv_fp16_cuda",
     "sageattn_qk_int8_pv_fp16_triton", "sageattn_qk_int8_pv_fp8_cuda",
@@ -26,6 +17,11 @@ SAGE_MODES = [
 H3_DEDICATED_ATTENTION_OFF = "关闭"
 H3_DEDICATED_ATTENTION_AUTO = "自动"
 H3_DEDICATED_ATTENTION_ON = "H3专用Sage加速"
+SLA_DENSE_BACKENDS = [
+    "comfy_kitchen", "pytorch", "sage:auto",
+    "sage:qk_int8_pv_fp16_cuda", "sage:qk_int8_pv_fp16_triton",
+    "sage:qk_int8_pv_fp8_cuda", "sage:qk_int8_pv_fp8_cuda++", "auto",
+]
 V7_GENERAL_SAGE_MODES = [
     H3_DEDICATED_ATTENTION_AUTO,
     "sageattn_qk_int8_pv_fp16_cuda",
@@ -41,9 +37,12 @@ V7_ATTENTION_MODES = [
 
 
 def _is_h3_video_model(filename: str) -> bool:
-    """接受官方及第三方命名的H3 Ref2VA/FL2VA扩散模型。"""
-    name = str(filename or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
-    return "h3" in name and any(tag in name for tag in ("ref2va", "fl2va"))
+    """接受H3目录中的任意重命名权重，以及目录外官方/第三方H3 Ref2VA/FL2VA命名。"""
+    normalized = str(filename or "").replace("\\", "/").strip("/")
+    parts = normalized.split("/")
+    name = parts[-1].lower() if parts else ""
+    in_h3_folder = any(part.lower() == "h3" for part in parts[:-1])
+    return in_h3_folder or ("h3" in name and any(tag in name for tag in ("ref2va", "fl2va")))
 
 
 def _select_fl2va_model(selected_model: str, installed: list[str]) -> str:
@@ -51,10 +50,10 @@ def _select_fl2va_model(selected_model: str, installed: list[str]) -> str:
     selected_name = str(selected_model or "").lower()
     if "fl2va" in selected_name and selected_model in installed:
         return selected_model
-    return next(
-        (x for x in installed if x.replace("\\", "/").lower().endswith(FL2VA_MODEL_NAME)),
-        FL2VA_MODEL_NAME,
-    )
+    found = next((x for x in installed if "fl2va" in x.replace("\\", "/").lower()), None)
+    if found:
+        return found
+    raise ValueError("当前ComfyUI实例未检测到已安装的MiniMax H3 FL2VA模型")
 
 
 SECOND_MODEL_SAME = "跟随一采模型（质量优先）"
@@ -787,6 +786,8 @@ class NanFengH3LowPeakLatentUpscaler:
 
         if device != "cuda":
             raise ValueError("V8.1生产潜空间放大固定使用CUDA，不提供CPU回退。")
+        if not str(model_name or "").strip():
+            raise ValueError("当前ComfyUI实例未检测到H3潜空间放大模型；请先安装到V16的latent_upscale_models目录并刷新")
         common = self._upstream_common()
         video_latent, audio_latent = LTXVSeparateAVLatent.execute(latent)
         source = video_latent["samples"]
@@ -1097,6 +1098,30 @@ class NanFengH3ReleaseBeforeConditionLoaders:
         return (clip_name, video_vae_name, audio_vae_name)
 
 
+class NanFengAudioPadToDuration:
+    """Right-pad a trimmed AUDIO waveform with deterministic silence to the requested integer duration."""
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"audio": ("AUDIO",), "duration": ("FLOAT", {"default": 5.0, "min": 1.0, "max": 15.0, "step": 1.0})}}
+
+    RETURN_TYPES = ("AUDIO",)
+    FUNCTION = "pad"
+    CATEGORY = "南风节点/内部"
+
+    def pad(self, audio, duration):
+        import torch
+        waveform = audio["waveform"]
+        sample_rate = int(audio["sample_rate"])
+        target_samples = int(round(float(duration) * sample_rate))
+        current_samples = int(waveform.shape[-1])
+        if current_samples < target_samples:
+            silence = torch.zeros(*waveform.shape[:-1], target_samples - current_samples, dtype=waveform.dtype, device=waveform.device)
+            waveform = torch.cat((waveform, silence), dim=-1)
+        elif current_samples > target_samples:
+            waveform = waveform[..., :target_samples]
+        return ({"waveform": waveform, "sample_rate": sample_rate},)
+
+
 class NanFengH3ReleaseBeforeSampling:
     """条件编码完成后、扩散采样前释放CLIP/VAE驻留，保留已生成的条件与latent。"""
 
@@ -1181,6 +1206,16 @@ class NanFengH3ApplyUniBlockSwap:
 
 
 class NanFengH3MultiReferenceGenerator:
+    @staticmethod
+    def _live_combo(values, preferred=None):
+        live = list(dict.fromkeys(str(value) for value in values if str(value).strip()))
+        options = {}
+        if preferred in live:
+            options["default"] = preferred
+        elif live:
+            options["default"] = live[0]
+        return (live, options)
+
     @classmethod
     def INPUT_TYPES(cls):
         try:
@@ -1189,9 +1224,9 @@ class NanFengH3MultiReferenceGenerator:
             text_encoders = folder_paths.get_filename_list("text_encoders")
             vaes = folder_paths.get_filename_list("vae")
         except Exception:
-            model_options = list(DEFAULT_MODEL_OPTIONS)
-            text_encoders = [DEFAULT_TEXT_ENCODER]
-            vaes = [DEFAULT_VIDEO_VAE, DEFAULT_AUDIO_VAE]
+            model_options = []
+            text_encoders = []
+            vaes = []
 
         # 与当前ComfyUI原生KSampler保持同一来源；第三方注册的新采样器也会自动进入列表。
         try:
@@ -1202,27 +1237,22 @@ class NanFengH3MultiReferenceGenerator:
             sampler_options = ["res_multistep"]
             scheduler_options = ["simple"]
 
-        h3_models = [x for x in model_options if _is_h3_video_model(x)] or list(DEFAULT_MODEL_OPTIONS)
-        # 用户实际可稳定运行的 F:/video_minimax_h3_r2v (1).json 使用完整INT8版，不是pruned版。
+        h3_models = [x for x in model_options if _is_h3_video_model(x)]
         source_model = next(
-            (
-                x for x in h3_models
-                if x.replace("\\", "/").lower().endswith("minimax_h3_ref2va_int8_convrot.safetensors")
-                and "pruned" not in x.lower()
-            ),
-            next((x for x in h3_models if "ref2va" in x.replace("\\", "/").lower()), h3_models[0]),
+            (x for x in h3_models if "ref2va" in x.replace("\\", "/").lower() and "pruned" not in x.lower()),
+            next((x for x in h3_models if "ref2va" in x.replace("\\", "/").lower()), h3_models[0] if h3_models else None),
         )
-        h3_text_encoders = [x for x in text_encoders if "minimax_h3" in x.lower()] or [DEFAULT_TEXT_ENCODER]
-        h3_video_vaes = [x for x in vaes if "minimax_h3_video_vae" in x.lower()] or [DEFAULT_VIDEO_VAE]
-        h3_audio_vaes = [x for x in vaes if "minimax_h3_audio_vae" in x.lower()] or [DEFAULT_AUDIO_VAE]
+        h3_text_encoders = [x for x in text_encoders if "minimax_h3" in x.lower()]
+        h3_video_vaes = [x for x in vaes if "minimax_h3_video_vae" in x.lower()]
+        h3_audio_vaes = [x for x in vaes if "minimax_h3_audio_vae" in x.lower()]
 
         required = OrderedDict([
-            ("模型", (h3_models, {"default": source_model})),
-            ("文本编码器", (h3_text_encoders, {"default": DEFAULT_TEXT_ENCODER if DEFAULT_TEXT_ENCODER in h3_text_encoders else h3_text_encoders[0]})),
+            ("模型", cls._live_combo(h3_models, source_model)),
+            ("文本编码器", cls._live_combo(h3_text_encoders)),
             ("文本编码器类型", (["minimax"], {"default": "minimax"})),
             ("文本编码器设备", (["default", "cpu"], {"default": "default"})),
-            ("视频VAE", (h3_video_vaes, {"default": h3_video_vaes[0]})),
-            ("音频VAE", (h3_audio_vaes, {"default": h3_audio_vaes[0]})),
+            ("视频VAE", cls._live_combo(h3_video_vaes)),
+            ("音频VAE", cls._live_combo(h3_audio_vaes)),
             ("模型权重精度", (["default", "fp8_e4m3fn", "fp8_e5m2"], {"default": "default"})),
             # 与 F:/video_minimax_h3_r2v (1).json 一致：KJ SageAttention=auto。
             ("SageAttention", (SAGE_MODES, {"default": "auto"})),
@@ -1263,11 +1293,29 @@ class NanFengH3MultiReferenceGenerator:
 
     def generate(self, 模型, 文本编码器, 文本编码器类型, 文本编码器设备, 视频VAE, 音频VAE,
                  模型权重精度, SageAttention, 允许编译, 画面比例, 百万像素, 尺寸倍数, 时长秒, 提示词, 随机种子,
-                 采样器, 调度器, 采样步数, 降噪强度, 参考图尺寸="match", 文生视频=False, 图生视频=False, 首尾帧=False, **kwargs):
+                 采样器, 调度器, 采样步数, 降噪强度, 参考图尺寸="match", 文生视频=False, 图生视频=False, 首尾帧=False, unique_id=None, **kwargs):
         from comfy_execution.graph_utils import GraphBuilder
         image_names = [_clean_filename(kwargs.get(f"图片{i}")) for i in range(1, 10)]
         video_names = [_clean_filename(kwargs.get(f"视频{i}")) for i in range(1, 4)]
         audio_names = [_clean_filename(kwargs.get(f"音频{i}")) for i in range(1, 4)]
+        audio_lock_enabled = (
+            type(self) is NanFengH3MultiReferenceGeneratorV10
+            and bool(kwargs.get("启用锁音频", False))
+        )
+        audio_drive_enabled = (
+            type(self) is NanFengH3MultiReferenceGeneratorV10
+            and bool(kwargs.get("开启音频驱动模式", False))
+        )
+        if audio_drive_enabled and not audio_lock_enabled:
+            # 智能音频驱动负责分镜拆分；真正采样必须显式勾选锁音频，避免只按画面分镜生成却重绘音轨。
+            raise ValueError("智能音频驱动生成必须同时勾选“开启锁音频”，才能把当前音频分段锁入NativeAudioLock。")
+        audio_drive_filename = _clean_filename(kwargs.get("音频驱动文件")) if audio_drive_enabled else ""
+        if type(self) is NanFengH3MultiReferenceGeneratorV10:
+            trigger = str(kwargs.get("恒定触发词", "")).strip()
+            body = str(提示词 or "").lstrip("\r\n")
+            提示词 = f"{trigger}\n{body}" if trigger and body else (trigger or body)
+        if audio_drive_enabled and not audio_drive_filename:
+            raise ValueError("智能音频驱动已开启，但没有可用于锁定的音频驱动文件。")
         selected_modes = [name for name, enabled in (("文生视频", 文生视频), ("图生视频", 图生视频), ("首尾帧", 首尾帧)) if enabled]
         if len(selected_modes) > 1:
             raise ValueError("文生视频、图生视频、首尾帧只能开启一个。")
@@ -1290,8 +1338,15 @@ class NanFengH3MultiReferenceGenerator:
             raise ValueError("图生视频模式必须上传1张图片作为首帧。")
         if fl_mode == "首尾帧" and image_count != 2:
             raise ValueError("首尾帧模式必须上传2张图片：图片1为首帧、图片2为尾帧。")
-        if not fl_mode and not any(image_names + video_names + audio_names):
+        effective_audio_names = [audio_drive_filename] if audio_drive_enabled else audio_names
+        if not fl_mode and not any(image_names + video_names + effective_audio_names):
             raise ValueError("请至少拖入一张图片、一个视频或一段音频。")
+        if audio_lock_enabled and fl_mode:
+            raise ValueError("锁音频只适用于多参Ref2VA模式；文生、图生和首尾帧模式不接受音频输入。")
+        if audio_lock_enabled and not (audio_drive_filename if audio_drive_enabled else audio_names[0]):
+            raise ValueError("开启锁音频后必须提供要锁定的完整源音轨；智能音频驱动模式使用其专属上传音频。")
+        if audio_lock_enabled and not audio_drive_enabled and (audio_names[1] or audio_names[2]):
+            raise ValueError("普通锁音频模式只锁定音频1；请清空音频2和音频3，避免最终音轨含义不明确。")
         original_ratio = isinstance(self, NanFengH3MultiReferenceGeneratorV4) and 画面比例 == "原图比例"
         if original_ratio and fl_mode not in {"图生视频", "首尾帧"}:
             raise ValueError("原图比例只适用于图生视频或首尾帧。")
@@ -1339,25 +1394,30 @@ class NanFengH3MultiReferenceGenerator:
         # V2-only chain. LoRA belongs immediately after the base diffusion model so every
         # later model patch (Sage/Sol-Attn) sees the LoRA-patched weights. V1 does not
         # expose these kwargs and therefore remains byte-for-byte equivalent at runtime.
-        if bool(kwargs.get("启用LoRA", False)):
-            for index in range(1, 4):
-                lora_name = _clean_filename(kwargs.get(f"LoRA{index}"))
-                strength = float(kwargs.get(f"LoRA{index}强度", 1.0))
-                if lora_name and strength != 0.0:
-                    model = g.node(
-                        "LoraLoaderModelOnly", model=model.out(0),
-                        lora_name=lora_name, strength_model=strength,
-                    )
+        individual_lora_slots = isinstance(self, NanFengH3MultiReferenceGeneratorV9)
+        for lora_name, strength in _enabled_lora_stack(kwargs, individual=individual_lora_slots):
+            model = g.node(
+                "LoraLoaderModelOnly", model=model.out(0),
+                lora_name=lora_name, strength_model=strength,
+            )
         sol_enabled = bool(kwargs.get("启用SolAttn", False))
         t8_enabled = bool(kwargs.get("启用T8缓存", False))
         selected_h3_attention = kwargs.get(
             "H3专用注意力",
             H3_DEDICATED_ATTENTION_ON if isinstance(self, NanFengH3MultiReferenceGeneratorV7) else H3_DEDICATED_ATTENTION_OFF,
         )
+        sla_enabled = isinstance(self, NanFengH3MultiReferenceGeneratorV9) and bool(kwargs.get("启用H3 SLA", False))
         h3_dedicated_attention = (
             isinstance(self, (NanFengH3MultiReferenceGeneratorV6, NanFengH3MultiReferenceGeneratorV7))
             and selected_h3_attention == H3_DEDICATED_ATTENTION_ON
+            and not sla_enabled
         )
+        if sla_enabled:
+            # SLA owns H3 self-attention. Existing generic/H3 Sage choices are bypassed,
+            # while SLA may independently use Sage only for its dense fallback backend.
+            SageAttention = "disabled"
+            sol_enabled = False
+            t8_enabled = False
         if isinstance(self, NanFengH3MultiReferenceGeneratorV7):
             # V7统一下拉：关闭、40系可用的通用Sage各后端、H3专用Sage；旧Sol/T8字段不再执行。
             SageAttention = (
@@ -1377,7 +1437,20 @@ class NanFengH3MultiReferenceGenerator:
             isinstance(self, NanFengH3MultiReferenceGeneratorV3)
             and (sol_enabled or t8_enabled)
         )
-        if h3_dedicated_attention:
+        if sla_enabled:
+            model = g.node(
+                "H3SLAAttention", model=model.out(0), enabled=True,
+                sparsity_ratio=float(kwargs.get("SLA稀疏率", 0.90)),
+                block_size=str(kwargs.get("SLA块大小", "64")),
+                min_seq_len=int(kwargs.get("SLA最短序列", 4096)),
+                dense_last_steps=int(kwargs.get("SLA末尾稠密步数", 1)),
+                protect_audio=bool(kwargs.get("SLA保护音频", True)),
+                dense_steps=str(kwargs.get("SLA指定稠密步", "0")),
+                dense_backend=str(kwargs.get("SLA稠密后端", "comfy_kitchen")),
+                disable_fp16_accum=bool(kwargs.get("SLA关闭FP16累加", True)),
+                stabilize_motion=bool(kwargs.get("SLA稳定运动", True)),
+            )
+        elif h3_dedicated_attention:
             model = g.node("MiniMaxH3MemoryEfficientSageAttentionPatch", model=model.out(0))
         elif SageAttention != "disabled" and not skip_sage_for_specialized:
             model = g.node("PathchSageAttentionKJ", model=model.out(0), sage_attention=SageAttention, allow_compile=bool(允许编译))
@@ -1468,9 +1541,10 @@ class NanFengH3MultiReferenceGenerator:
             prepared = g.node("MiniMaxH3ImageToVideo", **condition_inputs)
         else:
             # 1:1复刻Ref2VA：素材保持独立原生子节点缓存边界。
+            reference_audio_names = [audio_drive_filename] if audio_drive_enabled else audio_names
             condition_inputs = {
                 "clip": clip.out(0), "vae": video_vae.out(0), "audio_vae": audio_vae.out(0),
-                "prompt": build_native_prompt(提示词, image_count, [True for x in video_names if x], sum(bool(x) for x in audio_names)), "width": width, "height": height, "length": length,
+                "prompt": build_native_prompt(提示词, image_count, [True for x in video_names if x], sum(bool(x) for x in reference_audio_names)), "width": width, "height": height, "length": length,
                 # One sizing authority: upstream longest-edge 1920. Native "max" never upscales
                 # and therefore leaves this capped input unchanged apart from required 32px alignment.
                 # The legacy serialized widget remains for old-workflow index compatibility only.
@@ -1485,20 +1559,60 @@ class NanFengH3MultiReferenceGenerator:
                 components = g.node("GetVideoComponents", video=loaded.out(0))
                 condition_inputs[f"ref_videos.ref_video_{i}"] = components.out(0)
                 condition_inputs[f"ref_video_audios.ref_video_audio_{i}"] = components.out(1)
-            for i, filename in enumerate((x for x in audio_names if x)):
+            for i, filename in enumerate((x for x in reference_audio_names if x)):
                 loaded = g.node("LoadAudio", audio=filename)
+                if audio_drive_enabled:
+                    loaded = g.node(
+                        "TrimAudioDuration", audio=loaded.out(0),
+                        start_index=float(kwargs.get("音频驱动当前起点", 0.0)), duration=float(时长秒),
+                    )
                 condition_inputs[f"ref_audios.ref_audio_{i}"] = loaded.out(0)
             prepared = g.node("MiniMaxH3ReferenceToVideo", **condition_inputs)
         # 明确依赖屏障：只有条件编码完成后才安装可选Swap并释放CLIP/VAE，再开始采样。
         sampling_model_input = model.out(0)
+        sampling_latent_input = prepared.out(1)
+        exact_audio_output = None
         if uniblockswap_blocks is not None:
             sampling_model_input = g.node(
                 "NanFengH3ApplyUniBlockSwap", model=sampling_model_input,
                 conditioning_dependency=prepared.out(0), num_blocks=uniblockswap_blocks,
             ).out(0)
+        audio_lock_enabled = (
+            type(self) is NanFengH3MultiReferenceGeneratorV10
+            and bool(kwargs.get("启用锁音频", False))
+        )
+        if audio_lock_enabled:
+            # 对齐桌面【MiniMax】数字人唱歌工作流：同一条音频1既进入Ref2VA参考条件，
+            # 又编码进目标AV latent；视频mask=1继续生成，音频mask=0保持不被采样器重绘。
+            lock_audio_name = audio_drive_filename if audio_drive_enabled else audio_names[0]
+            lock_audio_start = float(kwargs.get("音频驱动当前起点", 0.0)) if audio_drive_enabled else 0.0
+            audio_drive_end = float(kwargs.get("音频驱动当前终点", 0.0)) if audio_drive_enabled else float(时长秒)
+            if audio_drive_enabled:
+                if audio_drive_end <= lock_audio_start:
+                    raise ValueError("智能音频驱动当前分镜的音频终点必须大于起点。")
+                expected_duration = max(1, math.ceil(audio_drive_end - lock_audio_start))
+                if expected_duration != int(float(时长秒)):
+                    raise ValueError(f"智能音频驱动分镜整数时长与裁切范围不一致：基本参数{int(float(时长秒))}秒，音频范围向上补齐后{expected_duration}秒。")
+            lock_audio_source = g.node("LoadAudio", audio=lock_audio_name)
+            lock_audio_trimmed = g.node(
+                "TrimAudioDuration", audio=lock_audio_source.out(0),
+                start_index=lock_audio_start, duration=float(时长秒),
+            )
+            if audio_drive_enabled:
+                lock_audio_trimmed = g.node(
+                    "NanFengAudioPadToDuration", audio=lock_audio_trimmed.out(0), duration=float(时长秒),
+                )
+            audio_lock = g.node(
+                "MiniMaxH3NativeAudioLock", model=sampling_model_input,
+                av_latent=sampling_latent_input, audio_vae=audio_vae.out(0),
+                audio=lock_audio_trimmed.out(0),
+            )
+            sampling_model_input = audio_lock.out(0)
+            sampling_latent_input = audio_lock.out(1)
+            exact_audio_output = audio_lock.out(2)
         sampling_ready = g.node(
             "NanFengH3ReleaseBeforeSampling",
-            model=sampling_model_input, conditioning=prepared.out(0), latent=prepared.out(1),
+            model=sampling_model_input, conditioning=prepared.out(0), latent=sampling_latent_input,
         )
         sampling_model = sampling_ready.out(0)
         if sol_config is not None:
@@ -1523,10 +1637,9 @@ class NanFengH3MultiReferenceGenerator:
         if hd_second_pass and sigma_requested:
             raise ValueError("V5高清二采与西格玛调节不能同时开启；请关闭其中一个。")
         # V1-V6保留原自动分流；V7完全服从用户显式Sigma策略，不读取模式、LoRA或全局修复状态。
-        lora_active = bool(kwargs.get("启用LoRA", False)) and any(
-            _clean_filename(kwargs.get(f"LoRA{index}")) and float(kwargs.get(f"LoRA{index}强度", 1.0)) != 0.0
-            for index in range(1, 4)
-        )
+        lora_active = bool(_enabled_lora_stack(
+            kwargs, individual=isinstance(self, NanFengH3MultiReferenceGeneratorV9)
+        ))
         is_v7 = isinstance(self, NanFengH3MultiReferenceGeneratorV7)
         sigma_strategy = str(kwargs.get("Sigma策略", "原生轨迹（不加步）")) if is_v7 else ""
         sigma_enabled = (
@@ -1541,6 +1654,16 @@ class NanFengH3MultiReferenceGenerator:
                 "MiniMaxH3SigmaShift", model=sampling_model,
                 shift_video=float(kwargs.get("视频西格玛偏移", 12.0)),
                 shift_audio=float(kwargs.get("音频西格玛偏移", 3.0)),
+            ).out(0)
+        is_v81 = isinstance(self, NanFengH3MultiReferenceGeneratorV81)
+        is_v9 = isinstance(self, NanFengH3MultiReferenceGeneratorV9)
+        if is_v9 and bool(kwargs.get("启用实时预览", True)):
+            sampling_model = g.node(
+                "NanFengH3KJPreviewBridge", model=sampling_model, target_node_id=str(unique_id or ""),
+                max_resolution=int(kwargs.get("实时预览最长边", 512)),
+                jpeg_quality=int(kwargs.get("实时预览JPEG质量", 75)),
+                preview_frames=int(kwargs.get("实时预览帧数", 12)),
+                preview_fps=int(kwargs.get("实时预览帧率", 8)),
             ).out(0)
         guider = g.node("BasicGuider", model=sampling_model, conditioning=sampling_ready.out(1))
         sampler = g.node("KSamplerSelect", sampler_name=采样器)
@@ -1659,7 +1782,20 @@ class NanFengH3MultiReferenceGenerator:
             second_model = g.node(
                 "UNETLoader", unet_name=second_ready.out(0), weight_dtype=模型权重精度,
             ).out(0)
-            if h3_dedicated_attention:
+            if sla_enabled:
+                second_model = g.node(
+                    "H3SLAAttention", model=second_model, enabled=True,
+                    sparsity_ratio=float(kwargs.get("SLA稀疏率", 0.90)),
+                    block_size=str(kwargs.get("SLA块大小", "64")),
+                    min_seq_len=int(kwargs.get("SLA最短序列", 4096)),
+                    dense_last_steps=int(kwargs.get("SLA末尾稠密步数", 1)),
+                    protect_audio=bool(kwargs.get("SLA保护音频", True)),
+                    dense_steps=str(kwargs.get("SLA指定稠密步", "0")),
+                    dense_backend=str(kwargs.get("SLA稠密后端", "comfy_kitchen")),
+                    disable_fp16_accum=bool(kwargs.get("SLA关闭FP16累加", True)),
+                    stabilize_motion=bool(kwargs.get("SLA稳定运动", True)),
+                ).out(0)
+            elif h3_dedicated_attention:
                 second_model = g.node(
                     "MiniMaxH3MemoryEfficientSageAttentionPatch", model=second_model,
                 ).out(0)
@@ -1703,7 +1839,7 @@ class NanFengH3MultiReferenceGenerator:
                 upscale_input = g.node("NanFengH3ReleaseBeforeLatentUpscale", latent=upscale_input).out(0)
             latent_upscaled = g.node(
                 "NanFengH3LowPeakLatentUpscaler" if is_v81 else "H3LatentUpscalerNodeMegapixels", latent=upscale_input,
-                model_name=str(kwargs.get("H3潜空间放大模型", "minimax_h3_latent_upscaler_3d_fp16.safetensors")),
+                model_name=str(kwargs.get("H3潜空间放大模型") or ""),
                 target_megapixels=float(kwargs.get("H3潜空间目标百万像素", 1.0)),
                 align=int(kwargs.get("H3潜空间对齐", 2)), device="cuda",
                 precision=str(kwargs.get("H3潜空间精度", "fp16")),
@@ -1761,16 +1897,26 @@ class NanFengH3MultiReferenceGenerator:
                     lora_name=requested,
                     strength_model=float(kwargs.get("H3二采LoRA强度", 0.6)),
                 ).out(0)
-            elif not is_v81 and second_lora_mode == "继承一采LoRA" and bool(kwargs.get("启用LoRA", False)):
-                for index in range(1, 4):
-                    lora_name = _clean_filename(kwargs.get(f"LoRA{index}"))
-                    strength = float(kwargs.get(f"LoRA{index}强度", 1.0))
-                    if lora_name and strength != 0.0:
-                        latent_second_model = g.node(
-                            "LoraLoaderModelOnly", model=latent_second_model,
-                            lora_name=lora_name, strength_model=strength,
-                        ).out(0)
-            if not is_v81 and h3_dedicated_attention:
+            elif not is_v81 and second_lora_mode == "继承一采LoRA":
+                for lora_name, strength in _enabled_lora_stack(kwargs, individual=False):
+                    latent_second_model = g.node(
+                        "LoraLoaderModelOnly", model=latent_second_model,
+                        lora_name=lora_name, strength_model=strength,
+                    ).out(0)
+            if not is_v81 and sla_enabled:
+                latent_second_model = g.node(
+                    "H3SLAAttention", model=latent_second_model, enabled=True,
+                    sparsity_ratio=float(kwargs.get("SLA稀疏率", 0.90)),
+                    block_size=str(kwargs.get("SLA块大小", "64")),
+                    min_seq_len=int(kwargs.get("SLA最短序列", 4096)),
+                    dense_last_steps=int(kwargs.get("SLA末尾稠密步数", 1)),
+                    protect_audio=bool(kwargs.get("SLA保护音频", True)),
+                    dense_steps=str(kwargs.get("SLA指定稠密步", "0")),
+                    dense_backend=str(kwargs.get("SLA稠密后端", "comfy_kitchen")),
+                    disable_fp16_accum=bool(kwargs.get("SLA关闭FP16累加", True)),
+                    stabilize_motion=bool(kwargs.get("SLA稳定运动", True)),
+                ).out(0)
+            elif not is_v81 and h3_dedicated_attention:
                 latent_second_model = g.node(
                     "MiniMaxH3MemoryEfficientSageAttentionPatch", model=latent_second_model,
                 ).out(0)
@@ -1811,10 +1957,40 @@ class NanFengH3MultiReferenceGenerator:
         video_decoder = "NanFengH3TimedVideoVAEDecode" if is_v81 else "VAEDecode"
         audio_decoder = "NanFengH3TimedAudioVAEDecode" if is_v81 else "VAEDecodeAudio"
         image_decode = g.node(video_decoder, samples=decode_samples, vae=video_vae.out(0))
-        audio_decode = g.node(audio_decoder, samples=decode_samples, vae=audio_vae.out(0))
+        audio_decode = None
+        if exact_audio_output is None:
+            audio_decode = g.node(audio_decoder, samples=decode_samples, vae=audio_vae.out(0))
 
         final_images = image_decode.out(0)
-        return {"result": (final_images, audio_decode.out(0)), "expand": g.finalize()}
+        if isinstance(self, NanFengH3MultiReferenceGeneratorV9) and bool(kwargs.get("启用RTX视频超分", False)):
+            resize_mode = "target dimensions" if str(kwargs.get("RTX缩放方式", "倍数缩放")) == "目标尺寸" else "scale by multiplier"
+            rtx_vsr = g.node(
+                "NanFengH3RTXVideoSuperResolution", images=final_images,
+                resize_mode=resize_mode,
+                scale=float(kwargs.get("RTX缩放倍数", 2.0)),
+                width=int(kwargs.get("RTX目标宽度", 1920)),
+                height=int(kwargs.get("RTX目标高度", 1080)),
+                quality=str(kwargs.get("RTX质量", "ULTRA")),
+            )
+            final_images = rtx_vsr.out(0)
+        final_audio = exact_audio_output if exact_audio_output is not None else audio_decode.out(0)
+        return {"result": (final_images, final_audio), "expand": g.finalize()}
+
+
+def _enabled_lora_stack(kwargs, *, individual=False):
+    """Return enabled LoRAs in visible slot order; V9/V10 use per-slot switches."""
+    limit = 8 if individual else 3
+    if not individual and not bool(kwargs.get("启用LoRA", False)):
+        return []
+    rows = []
+    for index in range(1, limit + 1):
+        if individual and not bool(kwargs.get(f"LoRA{index}启用", index <= 3)):
+            continue
+        lora_name = _clean_filename(kwargs.get(f"LoRA{index}"))
+        strength = float(kwargs.get(f"LoRA{index}强度", 1.0))
+        if lora_name and strength != 0.0:
+            rows.append((lora_name, strength))
+    return rows
 
 
 class NanFengH3MultiReferenceGeneratorV2(NanFengH3MultiReferenceGenerator):
@@ -2026,10 +2202,8 @@ class NanFengH3MultiReferenceGeneratorV8(NanFengH3MultiReferenceGeneratorV7):
         except Exception:
             latent_models = []
             h3_loras = []
-        preferred = "minimax_h3_latent_upscaler_3d_fp16.safetensors"
-        choices = list(latent_models) or [preferred]
         required["启用H3潜空间放大二采"] = ("BOOLEAN", {"default": False})
-        required["H3潜空间放大模型"] = (choices, {"default": preferred if preferred in choices else choices[0]})
+        required["H3潜空间放大模型"] = cls._live_combo(latent_models)
         required["H3潜空间目标百万像素"] = (
             "FLOAT", {"default": 1.0, "min": 0.1, "max": 8.0, "step": 0.1},
         )
@@ -2092,18 +2266,173 @@ class NanFengH3MultiReferenceGeneratorV81(NanFengH3MultiReferenceGeneratorV8):
     )
 
 
+class NanFengH3RTXVideoSuperResolution:
+    """V9内部RTX桥接：用普通ComfyUI输入调用V3 DynamicCombo节点，避免子图展开丢失resize_type。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "images": ("IMAGE",),
+            "resize_mode": (["scale by multiplier", "target dimensions"], {"default": "scale by multiplier"}),
+            "scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.01}),
+            "width": ("INT", {"default": 1920, "min": 64, "max": 8192, "step": 8}),
+            "height": ("INT", {"default": 1080, "min": 64, "max": 8192, "step": 8}),
+            "quality": (["LOW", "MEDIUM", "HIGH", "ULTRA"], {"default": "ULTRA"}),
+        }}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "upscale"
+    CATEGORY = "南风节点/内部"
+
+    def upscale(self, images, resize_mode="scale by multiplier", scale=2.0, width=1920, height=1080, quality="ULTRA"):
+        import importlib
+        try:
+            module = importlib.import_module("custom_nodes.Nvidia_RTX_Nodes_ComfyUI")
+            rtx_class = module.RTXVideoSuperResolution
+        except Exception:
+            try:
+                module = importlib.import_module("custom_nodes.comfyui_nvidia_rtx_nodes")
+                rtx_class = module.RTXVideoSuperResolution
+            except Exception as exc:
+                raise RuntimeError("无法加载已安装的RTX Video Super Resolution节点") from exc
+        resize_type = (
+            {"resize_type": "target dimensions", "width": int(width), "height": int(height)}
+            if resize_mode == "target dimensions"
+            else {"resize_type": "scale by multiplier", "scale": float(scale)}
+        )
+        output = rtx_class.execute(images=images, resize_type=resize_type, quality=str(quality))
+        if hasattr(output, "result"):
+            result = output.result
+            if result:
+                return (result[0],)
+        if isinstance(output, (tuple, list)) and output:
+            return (output[0],)
+        raise RuntimeError("RTX Video Super Resolution没有返回图像")
+
+
+class NanFengH3KJPreviewBridge:
+    """V9内部桥接：复用KJ实时预览wrapper，但把事件定向回南风V9主节点。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "target_node_id": ("STRING", {"default": ""}),
+            "max_resolution": ("INT", {"default": 512, "min": 128, "max": 2048, "step": 8}),
+            "jpeg_quality": ("INT", {"default": 75, "min": 30, "max": 100, "step": 1}),
+            "preview_frames": ("INT", {"default": 12, "min": 1, "max": 48, "step": 1}),
+            "preview_fps": ("INT", {"default": 8, "min": 1, "max": 24, "step": 1}),
+        }}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    CATEGORY = "南风节点/内部"
+
+    def apply(self, model, target_node_id, max_resolution=512, jpeg_quality=75, preview_frames=12, preview_fps=8):
+        try:
+            from custom_nodes.ComfyUI_KJNodes_main.nodes.preview_override_node import _PreviewOverrideWrapper
+        except Exception:
+            try:
+                import nodes
+                kj_cls = nodes.NODE_CLASS_MAPPINGS.get("ModelPreviewOverrideKJ")
+                module = __import__(kj_cls.__module__, fromlist=["_PreviewOverrideWrapper"]) if kj_cls else None
+                _PreviewOverrideWrapper = getattr(module, "_PreviewOverrideWrapper")
+            except Exception as exc:
+                raise RuntimeError("南风H3 V9实时预览需要已安装且可加载的KJNodes Model Preview Override") from exc
+        import comfy.patcher_extension
+        patched = model.clone()
+        patched.add_wrapper_with_key(
+            comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
+            "nanfeng_v9_kj_preview",
+            _PreviewOverrideWrapper(
+                int(max_resolution), str(target_node_id), int(jpeg_quality), True,
+                int(preview_frames), int(preview_fps), None, "none",
+            ),
+        )
+        return (patched,)
+
+
+## V8.1先不动：V9仅通过子类追加实时预览字段与桥接。
+class NanFengH3MultiReferenceGeneratorV9(NanFengH3MultiReferenceGeneratorV81):
+    """V9：V8.1完整生成逻辑 + KJ动态采样预览，V8.1保持不变。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        schema = super().INPUT_TYPES()
+        required = schema["required"]
+        schema["hidden"] = {"unique_id": "UNIQUE_ID"}
+        required["启用实时预览"] = ("BOOLEAN", {"default": True})
+        required["实时预览最长边"] = ("INT", {"default": 512, "min": 128, "max": 2048, "step": 8})
+        required["实时预览帧数"] = ("INT", {"default": 12, "min": 1, "max": 48, "step": 1})
+        required["实时预览帧率"] = ("INT", {"default": 8, "min": 1, "max": 24, "step": 1})
+        required["实时预览JPEG质量"] = ("INT", {"default": 75, "min": 30, "max": 100, "step": 1})
+        # V9尾部追加RTX VSR字段，避免影响V8.1及旧工作流的位置序列化。
+        required["启用RTX视频超分"] = ("BOOLEAN", {"default": False})
+        required["RTX缩放方式"] = (["倍数缩放", "目标尺寸"], {"default": "倍数缩放"})
+        required["RTX缩放倍数"] = ("FLOAT", {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.01})
+        required["RTX目标宽度"] = ("INT", {"default": 1920, "min": 64, "max": 8192, "step": 8})
+        required["RTX目标高度"] = ("INT", {"default": 1080, "min": 64, "max": 8192, "step": 8})
+        required["RTX质量"] = (["LOW", "MEDIUM", "HIGH", "ULTRA"], {"default": "ULTRA"})
+        # V9 SLA fields remain append-only after every existing V9 widget so saved workflows keep positional compatibility.
+        required["启用H3 SLA"] = ("BOOLEAN", {"default": False})
+        required["SLA稀疏率"] = ("FLOAT", {"default": 0.90, "min": 0.0, "max": 0.95, "step": 0.05})
+        required["SLA块大小"] = (["64", "128"], {"default": "64"})
+        required["SLA最短序列"] = ("INT", {"default": 4096, "min": 0, "max": 1000000, "step": 1024})
+        required["SLA末尾稠密步数"] = ("INT", {"default": 1, "min": 0, "max": 8, "step": 1})
+        required["SLA保护音频"] = ("BOOLEAN", {"default": True})
+        required["SLA指定稠密步"] = ("STRING", {"default": "0", "multiline": False})
+        required["SLA稠密后端"] = (SLA_DENSE_BACKENDS, {"default": "comfy_kitchen"})
+        required["SLA关闭FP16累加"] = ("BOOLEAN", {"default": True})
+        required["SLA稳定运动"] = ("BOOLEAN", {"default": True})
+        # V9/V10 keep the legacy master widget serialized but no longer execute or show it.
+        # Per-slot controls are appended so older workflows retain all positional values.
+        lora_choices = required["LoRA1"][0]
+        for index in range(1, 4):
+            required[f"LoRA{index}启用"] = ("BOOLEAN", {"default": True})
+        for index in range(4, 9):
+            required[f"LoRA{index}"] = (lora_choices, {"default": "未选择"})
+            required[f"LoRA{index}强度"] = ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05})
+            required[f"LoRA{index}启用"] = ("BOOLEAN", {"default": False})
+        return schema
+
+    DESCRIPTION = "南风H3 V9：继承V8.1连续Sigma同LoRA二采，并将KJ动态采样预览内嵌到主节点预览区。"
+
+
+class NanFengH3MultiReferenceGeneratorV10(NanFengH3MultiReferenceGeneratorV9):
+    """V10：完整复制V9；智能分镜默认使用独立NS提示词分镜Skill。"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        schema = super().INPUT_TYPES()
+        # V10专属字段只追加在V9完整序列末尾，保持所有旧工作流的位置序列化兼容。
+        schema["required"]["时长秒"] = ("FLOAT", {"default": 5.0, "min": 1.0, "max": 15.0, "step": 1.0})
+        schema["required"]["启用锁音频"] = ("BOOLEAN", {"default": False})
+        schema["required"]["开启音频驱动模式"] = ("BOOLEAN", {"default": False})
+        schema["required"]["音频驱动文件"] = ("STRING", {"default": ""})
+        schema["required"]["音频驱动打点"] = ("STRING", {"default": "[]"})
+        schema["required"]["音频驱动分段图片"] = ("STRING", {"default": "{}"})
+        schema["required"]["音频驱动分段分镜"] = ("STRING", {"default": "{}"})
+        schema["required"]["音频驱动创意"] = ("STRING", {"default": "", "multiline": True})
+        schema["required"]["音频驱动排除范围"] = ("STRING", {"default": "{}"})
+        schema["required"]["音频驱动当前起点"] = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.001})
+        schema["required"]["音频驱动当前终点"] = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 86400.0, "step": 0.001})
+        # 继续只在V10序列末尾追加：每次执行时作为单行前缀置于当前分镜提示词之前。
+        schema["required"]["恒定触发词"] = ("STRING", {"default": "", "multiline": False})
+        return schema
+
+    DESCRIPTION = "南风H3 V10：完整继承V9功能，智能分镜支持NS提示词分镜Skill，并可将音频1锁入目标AV latent。"
+
+
+from .native_audio_lock import MiniMaxH3NativeAudioLock
+
 NODE_CLASS_MAPPINGS = {
+    "NanFengH3MultiReferenceGeneratorV10": NanFengH3MultiReferenceGeneratorV10,
+    "MiniMaxH3NativeAudioLock": MiniMaxH3NativeAudioLock,
+    "NanFengAudioPadToDuration": NanFengAudioPadToDuration,
     "NanFengH3ApplyUniBlockSwap": NanFengH3ApplyUniBlockSwap,
     "NanFengH3NativePrefixLoraLoader": NanFengH3NativePrefixLoraLoader,
-    "NanFengH3MultiReferenceGenerator": NanFengH3MultiReferenceGenerator,
-    "NanFengH3MultiReferenceGeneratorV2": NanFengH3MultiReferenceGeneratorV2,
-    "NanFengH3MultiReferenceGeneratorV3": NanFengH3MultiReferenceGeneratorV3,
-    "NanFengH3MultiReferenceGeneratorV4": NanFengH3MultiReferenceGeneratorV4,
-    "NanFengH3MultiReferenceGeneratorV5": NanFengH3MultiReferenceGeneratorV5,
-    "NanFengH3MultiReferenceGeneratorV6": NanFengH3MultiReferenceGeneratorV6,
-    "NanFengH3MultiReferenceGeneratorV7": NanFengH3MultiReferenceGeneratorV7,
-    "NanFengH3MultiReferenceGeneratorV8": NanFengH3MultiReferenceGeneratorV8,
-    "NanFengH3MultiReferenceGeneratorV81": NanFengH3MultiReferenceGeneratorV81,
+    "NanFengH3RTXVideoSuperResolution": NanFengH3RTXVideoSuperResolution,
+    "NanFengH3KJPreviewBridge": NanFengH3KJPreviewBridge,
     "NanFengH3BlockOffloadPatch": NanFengH3BlockOffloadPatch,
     "NanFengH3ImageCanvasSize32": NanFengH3ImageCanvasSize32,
     "NanFengH3UpscaleForSecondPass": NanFengH3UpscaleForSecondPass,
@@ -2126,17 +2455,10 @@ NODE_CLASS_MAPPINGS = {
     "NanFengH3RebuildRefConditioningForUpscaledLatent": NanFengH3RebuildRefConditioningForUpscaledLatent,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "NanFengH3MultiReferenceGeneratorV10": "南风H3 V10 多参视频生成",
+    "NanFengAudioPadToDuration": "南风H3 音频尾段静音补齐",
     "NanFengH3ApplyUniBlockSwap": "南风H3 V8 UniBlockSwap延迟安装",
     "NanFengH3NativePrefixLoraLoader": "南风H3 原生4步LoRA加载器",
-    "NanFengH3MultiReferenceGenerator": "南风H3多参视频生成",
-    "NanFengH3MultiReferenceGeneratorV2": "南风H3多参视频生成V2",
-    "NanFengH3MultiReferenceGeneratorV3": "南风H3多参视频生成V3",
-    "NanFengH3MultiReferenceGeneratorV4": "南风H3多参视频生成V4",
-    "NanFengH3MultiReferenceGeneratorV5": "南风H3多参视频生成V5",
-    "NanFengH3MultiReferenceGeneratorV6": "南风H3多参视频生成V6",
-    "NanFengH3MultiReferenceGeneratorV7": "南风H3多参视频生成V7",
-    "NanFengH3MultiReferenceGeneratorV8": "南风H3多参视频生成V8",
-    "NanFengH3MultiReferenceGeneratorV81": "南风H3 V8.1 多参视频生成（6+4同LoRA）",
     "NanFengH3BlockOffloadPatch": "南风H3 分块处理（Block Offload）",
     "NanFengH3ImageCanvasSize32": "南风H3 原图比例画布尺寸",
     "NanFengH3AddFinalSigmaStep": "南风H3 FL2VA末段微量Sigma修复",
